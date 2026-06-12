@@ -8,6 +8,7 @@ export interface Project {
   name: string;
   identity: string | null;
   skip_permissions: boolean;
+  reconcile_enabled: boolean;
   created_at: string;
 }
 
@@ -39,6 +40,7 @@ export function initialize(dbPath: string): void {
       name TEXT UNIQUE NOT NULL,
       skip_permissions INTEGER DEFAULT 1,
       identity TEXT,
+      reconcile_enabled INTEGER DEFAULT 1,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -78,6 +80,16 @@ export function initialize(dbPath: string): void {
     db.exec('ALTER TABLE projects ADD COLUMN identity TEXT');
   }
 
+  // Migration: add reconcile_enabled column to existing DBs that predate it.
+  const reconcileCol = db
+    .prepare(
+      "SELECT COUNT(*) AS c FROM pragma_table_info('projects') WHERE name = 'reconcile_enabled'",
+    )
+    .get() as { c: number };
+  if (reconcileCol.c === 0) {
+    db.exec('ALTER TABLE projects ADD COLUMN reconcile_enabled INTEGER DEFAULT 1');
+  }
+
   resetStuckSessions();
 }
 
@@ -106,6 +118,13 @@ export function updateProjectIdentity(name: string, identity: string | null): bo
   const result = db
     .prepare('UPDATE projects SET identity = ? WHERE name = ?')
     .run(identity, name);
+  return result.changes > 0;
+}
+
+export function setProjectReconcileEnabled(name: string, enabled: boolean): boolean {
+  const result = db
+    .prepare('UPDATE projects SET reconcile_enabled = ? WHERE name = ?')
+    .run(enabled ? 1 : 0, name);
   return result.changes > 0;
 }
 
@@ -146,10 +165,18 @@ function toProject(row: any): Project {
     ...row,
     skip_permissions: !!row.skip_permissions,
     identity: row.identity ?? null,
+    reconcile_enabled: !!row.reconcile_enabled,
   };
 }
 
 // --- Sessions ---
+
+export function getSessionByProjectId(projectId: string): Session | null {
+  const row = db
+    .prepare('SELECT * FROM sessions WHERE project_id = ?')
+    .get(projectId) as Session | undefined;
+  return row ?? null;
+}
 
 export function getOrCreateSession(projectId: string): Session {
   const existing = db
@@ -221,6 +248,27 @@ export function insertSpawnLog(entry: SpawnLogEntry): void {
     entry.success ? 1 : 0,
     entry.costUsd,
   );
+}
+
+/** Most recent spawn that represents real conversation activity (anything but reconcile). */
+export function getLastActivityAt(projectId: string): string | null {
+  const row = db
+    .prepare(
+      `SELECT MAX(started_at) AS ts FROM spawn_log
+       WHERE project_id = ? AND kind != 'reconcile'`,
+    )
+    .get(projectId) as { ts: string | null };
+  return row.ts;
+}
+
+export function getLastSuccessfulReconcileAt(projectId: string): string | null {
+  const row = db
+    .prepare(
+      `SELECT MAX(started_at) AS ts FROM spawn_log
+       WHERE project_id = ? AND kind = 'reconcile' AND success = 1`,
+    )
+    .get(projectId) as { ts: string | null };
+  return row.ts;
 }
 
 function resetStuckSessions(): void {

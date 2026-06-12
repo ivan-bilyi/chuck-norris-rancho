@@ -492,6 +492,38 @@ export async function handleAutoReview(
   }
 }
 
+// ── Nightly reconcile (called by the reconcile scheduler) ────
+
+export async function handleReconcile(
+  project: db.Project,
+): Promise<spawner.SpawnResult> {
+  const pp = project.project_path;
+
+  // Wait until any user-message processing finishes. Poll cheaply; reconcile is not urgent.
+  while (processing.has(pp) || spawner.isRunning(pp)) {
+    await new Promise((r) => setTimeout(r, 500));
+  }
+
+  processing.add(pp);
+  try {
+    const session = db.getOrCreateSession(project.id);
+    db.updateSessionStatus(session.id, 'running');
+
+    const result = await runWithRetry('/reconcile', project, session, 'reconcile');
+    updateSession(session, result);
+
+    if (result.success) {
+      // Close the session: the next message starts fresh, with the distilled
+      // memory files in context via the project CLAUDE.md imports.
+      db.updateSessionClaudeId(session.id, null);
+    }
+
+    return result;
+  } finally {
+    processing.delete(pp);
+  }
+}
+
 // ── Spawn with session-error retry ───────────────────────────
 
 async function runWithRetry(
