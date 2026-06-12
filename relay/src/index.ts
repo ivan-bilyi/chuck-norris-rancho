@@ -4,6 +4,7 @@ import * as bot from './bot.js';
 import * as spawner from './spawner.js';
 import * as notify from './notify.js';
 import * as notifyServer from './notify-server.js';
+import * as reconcile from './reconcile.js';
 
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const RELAY_DB_PATH = process.env.RELAY_DB_PATH || './relay.db';
@@ -25,6 +26,7 @@ bot
   .then(() => {
     notify.setDiscordClient(bot.getClient());
     notifyServer.start(NOTIFY_PORT, NOTIFY_TOKEN);
+    reconcile.start();
   })
   .catch((err) => {
     console.error(`[${new Date().toISOString()}] Failed to start bot:`, err);
@@ -39,6 +41,7 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   console.log(`[${new Date().toISOString()}] ${signal} received, shutting down...`);
 
+  reconcile.stop();
   await notifyServer.stop();
   await spawner.killAll(30_000);
   await bot.destroy();
