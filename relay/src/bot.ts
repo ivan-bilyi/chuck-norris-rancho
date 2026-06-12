@@ -140,6 +140,23 @@ async function registerSlashCommands(token: string): Promise<void> {
       )
       .addSubcommand((sub) =>
         sub
+          .setName('reconcile')
+          .setDescription('Enable/disable the nightly reconcile for a project')
+          .addStringOption((o) =>
+            o
+              .setName('name')
+              .setDescription('Project name')
+              .setRequired(true),
+          )
+          .addBooleanOption((o) =>
+            o
+              .setName('enabled')
+              .setDescription('true = run nightly reconcile, false = leave the session alone')
+              .setRequired(true),
+          ),
+      )
+      .addSubcommand((sub) =>
+        sub
           .setName('set-identity')
           .setDescription('Set or clear chuck-wiki MCP identity for a project')
           .addStringOption((o) =>
@@ -189,6 +206,7 @@ async function handleCommand(
     if (sub === 'add') return handleProjectAdd(interaction);
     if (sub === 'list') return handleProjectList(interaction);
     if (sub === 'remove') return handleProjectRemove(interaction);
+    if (sub === 'reconcile') return handleProjectReconcile(interaction);
     if (sub === 'set-identity') return handleProjectSetIdentity(interaction);
   }
 
@@ -237,6 +255,27 @@ async function handleProjectAdd(
   );
 }
 
+async function handleProjectReconcile(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  const name = interaction.options.getString('name', true);
+  const enabled = interaction.options.getBoolean('enabled', true);
+
+  const updated = db.setProjectReconcileEnabled(name, enabled);
+  if (!updated) {
+    await interaction.reply({
+      content: `Project "${name}" not found.`,
+      ephemeral: true,
+    });
+    return;
+  }
+  await interaction.reply(
+    enabled
+      ? `Nightly reconcile **enabled** for **${name}**.`
+      : `Nightly reconcile **disabled** for **${name}** — its session will not be closed at night.`,
+  );
+}
+
 async function handleProjectSetIdentity(
   interaction: ChatInputCommandInteraction,
 ): Promise<void> {
@@ -273,7 +312,8 @@ async function handleProjectList(
 
   const lines = projects.map((p) => {
     const id = p.identity ? ` — id:\`${p.identity}\`` : '';
-    return `**${p.name}** — <#${p.discord_channel_id}> — \`${p.project_path}\`${id}`;
+    const rec = p.reconcile_enabled ? '' : ' — reconcile:off';
+    return `**${p.name}** — <#${p.discord_channel_id}> — \`${p.project_path}\`${id}${rec}`;
   });
   await interaction.reply(lines.join('\n'));
 }

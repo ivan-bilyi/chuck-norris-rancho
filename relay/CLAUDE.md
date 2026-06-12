@@ -22,6 +22,7 @@ Relay is a dumb pipe. All intelligence lives inside Claude Code sessions, driven
 - `src/db.ts` — SQLite schema and queries (projects, sessions)
 - `src/spawner.ts` — Claude CLI process spawning, JSON output parsing, timeout
 - `src/router.ts` — Message routing: channel -> project -> session -> spawn -> reply
+- `src/reconcile.ts` — Nightly reconcile scheduler (node-cron): distill sessions into `.chuck/memory/`, close them
 - `src/discord-format.ts` — Output formatting and 2000-char message splitting
 
 ## Build & Run
@@ -41,6 +42,7 @@ npm run dev     # run TypeScript directly with tsx (development)
 - Working directory for Claude is set via spawn `cwd` option, not a CLI flag
 - One task at a time per project (reject if busy)
 - Session resumed via `--resume <session_id>` for conversation continuity
+- Sessions are bounded: the nightly reconcile (default 03:00, `RELAY_RECONCILE_CRON`) resumes each active session one last time with the fixed prompt `/reconcile` (the skill on the Mac distills the conversation into the project's `.chuck/memory/` files), posts the skill's short report to the channel, and nulls `claude_session_id` so the morning starts fresh. Sessions idle for >7 days are closed without a run. Per-project opt-out: `/project reconcile <name> false`.
 
 ## Key Constraints
 
