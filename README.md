@@ -39,6 +39,7 @@ Relay is a dumb pipe. All intelligence lives inside native Claude Code CLI sessi
 | `scripts/restart.sh` | Restart Relay service |
 | `scripts/status.sh` | Full system status |
 | `scripts/setup-ssh.sh` | Configure SSH (`mac` target) |
+| `scripts/test-n-merge.sh` | Test current feature branch (tsc + vitest), merge to `main`, push, delete branch |
 
 ## Discord Commands
 
