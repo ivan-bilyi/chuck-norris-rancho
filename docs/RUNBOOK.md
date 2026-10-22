@@ -120,8 +120,17 @@ Example: `/project add zbroya /Users/i.beliy/projects/zbroya.science #zbroya-sci
 
 ### Claude CLI errors
 
-1. OAuth token expired: `ssh rancho "claude setup-token"`
-2. After re-auth, restart Relay: `bash scripts/restart.sh`
+OAuth token expired or rotated:
+
+1. Get a new token: `ssh -t rancho 'claude setup-token'` (prints `sk-ant-oat01-...`).
+2. Install it with `~/bin/set-claude-token.sh`, a copy of `infra/set-claude-token.sh`. It
+   restarts Relay and verifies the token. The token never goes on a command line, which would
+   put it in shell history and `ps`:
+   - interactive: `ssh -t rancho '~/bin/set-claude-token.sh'`, then paste at the hidden prompt;
+   - from the laptop clipboard: `pbpaste | ssh rancho '~/bin/set-claude-token.sh'`.
+
+   The script refuses arguments. It writes `~/relay/.env` atomically with mode 0600, keeps a
+   0600 backup `.env.bak.<timestamp>`, and tightens older backups to 0600.
 
 ### Session stuck in "running" state
 
