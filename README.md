@@ -26,7 +26,7 @@ Relay is a dumb pipe. All intelligence lives inside native Claude Code CLI sessi
 2. From Windows: `bash scripts/setup-ssh.sh mac <TAILSCALE_IP>`
 3. Deploy: `scp infra/setup-mac.sh rancho:/tmp/ && ssh rancho 'bash /tmp/setup-mac.sh'`
 4. Configure: `ssh rancho "claude setup-token"` + fill `DISCORD_BOT_TOKEN` in `~/relay/.env`
-5. Deploy Relay: `bash scripts/deploy.sh`
+5. Deploy Relay on the Mac, from the repo clone there: `ssh rancho 'cd ~/chuck-norris-rancho && git pull --ff-only && scripts/relay-deploy.sh'`
 6. Test: `bash scripts/status.sh` + send Discord message
 
 ## Scripts
@@ -34,7 +34,7 @@ Relay is a dumb pipe. All intelligence lives inside native Claude Code CLI sessi
 | Script | Description |
 |--------|-------------|
 | `infra/setup-mac.sh` | Full Mac Mini setup (Node.js, Claude CLI, Relay, launchd) |
-| `scripts/deploy.sh` | Deploy Relay to Mac Mini |
+| `scripts/relay-deploy.sh` | Deploy Relay (run **on** the Mac Mini from `~/chuck-norris-rancho`): build a git SHA outside `~/relay`, swap only the code, restart, smoke-test, record the SHA in `~/relay/REVISION`; automatic and one-command rollback. See [RUNBOOK](docs/RUNBOOK.md#relay-deploy) |
 | `scripts/logs.sh` | Tail Relay logs (`error` option) |
 | `scripts/restart.sh` | Restart Relay service |
 | `scripts/status.sh` | Full system status |

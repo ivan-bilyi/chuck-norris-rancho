@@ -33,6 +33,8 @@ npm start       # run compiled JS
 npm run dev     # run TypeScript directly with tsx (development)
 ```
 
+Production deploy: `scripts/relay-deploy.sh`, run on the host from the repo clone. It builds a git SHA, swaps only the code in `~/relay` (keeping `~/relay.prev` for `--rollback`), restarts, smoke-tests and records the SHA in `~/relay/REVISION`. Never edit `~/relay` by hand. See `docs/RUNBOOK.md` (Relay deploy).
+
 ## Conventions
 
 - All database operations are synchronous (better-sqlite3)

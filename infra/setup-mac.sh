@@ -51,7 +51,7 @@ if [ -f "$RELAY_SRC/package.json" ]; then
   echo "Relay built successfully"
 else
   echo "WARNING: Relay source not found at $RELAY_SRC"
-  echo "Deploy with: bash scripts/deploy.sh (from Windows)"
+  echo "Deploy with: scripts/relay-deploy.sh (on this Mac, from the repo clone)"
 fi
 
 # Create .env from template if not exists
@@ -141,7 +141,7 @@ if [ -f "$RELAY_SRC/dist/index.js" ] && [ -f "$RELAY_SRC/.env" ]; then
   echo "Relay LaunchAgent loaded"
 else
   echo "WARNING: Relay not started — missing dist/index.js or .env"
-  echo "Deploy with: bash scripts/deploy.sh, then: bash scripts/restart.sh"
+  echo "Deploy with: scripts/relay-deploy.sh (on this Mac, from the repo clone)"
 fi
 
 echo ""
@@ -164,7 +164,7 @@ echo ""
 echo "Next steps:"
 echo "1. claude setup-token  (if not already authorized)"
 echo "2. Fill DISCORD_BOT_TOKEN in ~/relay/.env"
-echo "3. bash scripts/deploy.sh  (from Windows, to deploy Relay source)"
+echo "3. Clone the repo to ~/chuck-norris-rancho, then run scripts/relay-deploy.sh there"
 echo "4. bash scripts/restart.sh  (from Windows, to start the service)"
 echo "5. Pair Syncthing with Windows"
 echo "6. Test: send message in Discord"

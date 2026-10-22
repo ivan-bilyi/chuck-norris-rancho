@@ -65,7 +65,7 @@ The script automatically:
 
 1. `ssh rancho "claude setup-token"` -> open URL in browser -> authorize -> paste code
 2. Fill in Discord bot token: `ssh rancho "nano ~/relay/.env"`
-3. Deploy Relay source: `bash scripts/deploy.sh`
+3. Clone this repo to `~/chuck-norris-rancho` on the Mac and deploy Relay from it: see [Relay deploy](#relay-deploy). The deploy loads the launchd service if it is not loaded yet.
 4. Pair Syncthing: `ssh -L 8384:localhost:8384 rancho` -> http://localhost:8384
 5. Test: `bash scripts/status.sh` -> send message in Discord
 6. Reboot test: `ssh rancho "sudo shutdown -r now"` -> wait 3 min -> `bash scripts/status.sh`
@@ -103,9 +103,7 @@ bash scripts/restart.sh
 ```
 
 ### Deploy update
-```bash
-bash scripts/deploy.sh
-```
+See [Relay deploy](#relay-deploy).
 
 ### Register a new project
 In Discord: `/project add <name> <path> <channel>`
@@ -154,9 +152,7 @@ Bot tab -> Privileged Gateway Intents -> Message Content Intent -> Save.
 ## Maintenance
 
 ### Update Relay
-```bash
-bash scripts/deploy.sh
-```
+See [Relay deploy](#relay-deploy).
 
 ### Update Claude Code CLI
 ```bash
@@ -168,6 +164,72 @@ bash scripts/restart.sh
 ```bash
 ssh rancho "cp ~/relay/relay.db ~/relay/relay.db.bak"
 ```
+
+## Relay deploy
+
+Relay is deployed **on the Mac**, from the repo clone `~/chuck-norris-rancho`, by
+`scripts/relay-deploy.sh`. It builds a git revision outside the live tree and swaps in only
+the code, so `~/relay` always runs a known commit. There is no laptop-side deploy: copying a
+working tree to the host ships uncommitted or unmerged code and leaves no record of what runs.
+
+```bash
+# plan only: current state, target SHA, what moves and what stays (changes nothing)
+ssh rancho 'cd ~/chuck-norris-rancho && git pull --ff-only && scripts/relay-deploy.sh --dry-run'
+
+# deploy origin/main (or: --sha <rev>)
+ssh rancho 'cd ~/chuck-norris-rancho && git pull --ff-only && scripts/relay-deploy.sh'
+
+# what is deployed
+ssh rancho 'cat ~/relay/REVISION'
+
+# roll back to the previous code (run it again to return)
+ssh rancho '~/chuck-norris-rancho/scripts/relay-deploy.sh --rollback'
+```
+
+What the script does:
+
+1. `git fetch` in the clone (refs only; the clone's work tree is not touched), then
+   `git archive <sha> relay/` into a fresh build dir under `~/.cache/relay-deploy/`.
+2. `npm ci` and `npm run build` there with the node binary named in the launchd plist, then it
+   loads every dependency under that node. Native modules must match the node that runs Relay.
+3. It waits until Relay has no `claude` child process (no turn in flight; `--no-wait` skips this).
+4. It moves the live **code** items (`dist node_modules package.json package-lock.json REVISION
+   src tsconfig.json CLAUDE.md relay.env.example templates`) to `~/relay.prev` and moves the
+   new build in. These are renames on one volume.
+5. `launchctl kickstart -k gui/<uid>/com.rancho.relay`, or `launchctl bootstrap` with the plist when the service is not loaded. Then a smoke test:
+   - a new pid is running;
+   - the log shows `Relay online as` (Discord ready) and `Reconcile scheduler started`;
+   - `GET 127.0.0.1:<RELAY_NOTIFY_PORT>/healthz` answers 200;
+   - the pid stays up for 10 s;
+   - a one-line `claude -p` auth probe on Haiku runs with Relay's own token.
+6. If a service check fails, it swaps the previous code back and restarts again (exit 4).
+   `~/relay.prev` then holds the failed build, marked so that `--rollback` refuses it.
+   A failed auth probe does not roll back, because rolling back would not fix auth. The run
+   exits 3: refresh the token with `infra/set-claude-token.sh`.
+
+Never touched: `.env*`, `relay.db*`, `logs/` and anything else in `~/relay` that is not a code
+item. The script reads only the log and two `.env` settings: `RELAY_NOTIFY_PORT`, and
+`CLAUDE_CODE_OAUTH_TOKEN`, which is passed to the auth probe through its environment and never printed.
+
+`~/relay/REVISION` is the deploy record. Its format is `key=value` lines: `sha`, `ref`,
+`subject`, `deployed_at` (UTC), `node`. It moves with the code, so after a rollback it names
+what actually runs. A missing file means the live code was not deployed by this script. Each
+run appends one line to `~/.cache/relay-deploy/history.log`.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | deployed |
+| 1 | failed before anything live changed |
+| 2 | usage error |
+| 3 | deployed, but the auth probe failed |
+| 4 | smoke test failed and the previous code is live again |
+| 5 | smoke test failed and the revert did not come up either: check the service by hand |
+
+Paths and the label come from the launchd plist and `$HOME`. They can be overridden with
+`RELAY_*` variables (see the script header). Other flags: `--build-only`, `--no-fetch`,
+`--no-auth-probe`.
 
 ## Vitrina (self-hosted artifacts)
 
