@@ -206,21 +206,36 @@ foreground run without tying it to the SSH session, `screen` is available on the
 
 What the script does:
 
-1. It checks for leftovers of an interrupted earlier run (`~/relay.swap`, `~/relay.next`,
-   `~/relay.prev.old`, a `~/relay.prev` it did not make). It deletes only what never went live
-   and refuses, before changing anything, when a leftover may hold code that ran.
-2. `git fetch` in the clone (refs only; the clone's work tree is not touched), then
-   `git archive <sha> relay/` into a fresh build dir under `~/.cache/relay-deploy/`.
+1. It checks for leftovers of an interrupted earlier run before changing anything:
+   - **Deleted:** staging that never went live (`~/relay.next.partial`, or a `~/relay.next`
+     whose status is `staged`). Also deleted: an older rollback target `~/relay.prev.old` when
+     the newer `~/relay.prev` exists, which stays the rollback target.
+   - **Renamed back:** `~/relay.prev.old` becomes `~/relay.prev` when neither `~/relay.prev`
+     nor `~/relay.next` exists.
+   - **Refused,** with the commands to resolve it: `~/relay.swap`, a `~/relay.prev` it did not
+     make, or a `~/relay.next` holding code that was live. These are cases where a leftover may
+     be the only copy of code that ran.
+2. `git fetch` in the clone (refs only; the clone's work tree is not touched). If the target
+   commit is already live with status `ok`, the run says "already live", changes nothing (no
+   restart, `~/relay.prev` kept), runs the auth probe and exits 0, or 3 if the probe fails.
+   `--force` rebuilds and restarts it anyway. Otherwise it runs `git archive <sha> relay/`
+   into a fresh build dir under `~/.cache/relay-deploy/`.
 3. `npm ci` and `npm run build` there with the node binary named in the launchd plist, then it
    loads every dependency under that node. Native modules must match the node that runs Relay.
-4. It stages the build in `~/relay.next`, then waits until Relay has no `claude` child process
-   (no turn in flight; up to 15 minutes; `--no-wait` skips this).
+4. It stages the build in `~/relay.next`. The build is assembled in `~/relay.next.partial` and
+   renamed when complete. Then it waits until Relay has no `claude` child process (no turn in
+   flight; up to 15 minutes; `--no-wait` skips this).
 5. From here signals are ignored. It re-checks that no turn started meanwhile (if one did, it
    waits again). Then it swaps the live **code** items (`dist node_modules package.json
    package-lock.json REVISION src tsconfig.json CLAUDE.md relay.env.example templates`) with
-   the staged ones by renames on one volume. The code that was live becomes `~/relay.prev`, the
-   rollback target. If that code had itself never passed a smoke test (an earlier run was
-   killed), it is dropped and the existing `~/relay.prev` stays the rollback target.
+   the staged ones by renames on one volume. What happens to the code that was live:
+   - **Proven** (status `ok`, or code from before this script): it becomes `~/relay.prev`, the
+     rollback target.
+   - **Same commit** (`--force`): it is still the revert target if the restart fails. On
+     success the existing `~/relay.prev` is kept, because a copy of the live commit is no use
+     as a rollback target.
+   - **Never passed a smoke test** (an earlier run was killed): it is dropped, and the existing
+     `~/relay.prev` stays the rollback target and the revert target.
 6. `launchctl kickstart -k gui/<uid>/com.rancho.relay`, or `launchctl bootstrap` with the
    plist when the service is not loaded. Then a smoke test:
    - a new pid is running;
@@ -230,9 +245,10 @@ What the script does:
 
    A fatal start error in the error log (`Failed to start bot`, a missing bot token) or the
    process going away fails the test at once instead of waiting for the 90 s timeout.
-7. If the smoke test fails, it swaps the previous code back, restarts and smoke-tests again.
+7. If the smoke test fails, it swaps the revert target back, restarts and smoke-tests again.
    It drops the new build and puts the old `~/relay.prev` back, so after exit 4 everything is
-   as it was.
+   as it was. The one exception is a run that started from unproven live code: there the
+   proven `~/relay.prev` is what goes live, and the message says so.
 8. A one-line `claude -p` auth probe on Haiku runs with Relay's own token, with a 120 s timeout.
    A failed probe does not roll back, because rolling back would not change auth or the
    network. The run exits 3: refresh the token (see Claude CLI errors) or check the network.
@@ -260,7 +276,7 @@ Exit codes (every failure maps to one of these; git or npm errors do not pass th
 
 | Code | Meaning |
 |---|---|
-| 0 | deployed or rolled back |
+| 0 | deployed, rolled back, or already live |
 | 1 | failed or interrupted before anything live changed, including any git/npm/build error |
 | 2 | usage error |
 | 3 | deployed, but the auth probe failed or timed out |
@@ -278,8 +294,8 @@ message lists what to check, in order:
 Once the cause is fixed, `launchctl kickstart -k` the service and re-run the deploy.
 
 Paths and the label come from the launchd plist and `$HOME`. They can be overridden with
-`RELAY_*` variables (see the script header). Other flags: `--build-only`, `--no-fetch`,
-`--no-wait`, `--no-auth-probe`.
+`RELAY_*` variables (see the script header). Other flags: `--force`, `--build-only`,
+`--no-fetch`, `--no-wait`, `--no-auth-probe`.
 
 ## Vitrina (self-hosted artifacts)
 

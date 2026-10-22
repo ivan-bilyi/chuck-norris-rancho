@@ -8,12 +8,14 @@
 #   2. runs npm ci + npm run build there with the node binary the launchd
 #      service runs, and checks that the dependencies (native ones included)
 #      load under that node;
-#   3. stages the build in <live>.next (the live tree and <live>.prev are not
-#      touched yet), then waits until Relay has no claude child process;
+#   3. stages the build in <live>.next (built up in <live>.next.partial and
+#      renamed when complete; the live tree and <live>.prev are not touched
+#      yet), then waits until Relay has no claude child process;
 #   4. re-checks that nothing is in flight and, from here on ignoring
 #      HUP/INT/TERM/PIPE, swaps only the CODE items (CODE_ITEMS below) of the
 #      live tree; the code that was live becomes <live>.prev, the rollback
-#      target;
+#      target, unless it is the same commit or never passed a smoke test (then
+#      the existing <live>.prev stays the rollback target);
 #   5. restarts the service with launchctl kickstart (or loads it with
 #      launchctl bootstrap when it is not loaded) and smoke-tests it: new pid
 #      running, "Relay online as" (Discord ready) and "Reconcile scheduler
@@ -43,9 +45,13 @@
 # names what runs. No REVISION means code that was live before this script
 # existed; it counts as a valid rollback target.
 #
+# Deploying the commit that is already live with status ok changes nothing:
+# the run says "already live", runs the auth probe and exits 0 (or 3).
+# --force rebuilds and restarts it anyway, keeping <live>.prev as it is.
+#
 # Usage:
 #   scripts/relay-deploy.sh [--sha <rev>] [--dry-run] [--build-only] [--detach]
-#                           [--no-fetch] [--no-wait] [--no-auth-probe]
+#                           [--force] [--no-fetch] [--no-wait] [--no-auth-probe]
 #   scripts/relay-deploy.sh --rollback [--dry-run] [--detach] [--no-wait]
 #
 #   --sha <rev>      what to deploy (default: <remote>/main, after a fetch)
@@ -54,6 +60,7 @@
 #   --detach         run in the background (nohup), safe to disconnect; the
 #                    output goes to <build root>/last-run.log, whose last line
 #                    is "relay-deploy: finished: exit <code>"
+#   --force          rebuild and restart even if the target is already live
 #   --no-fetch       use the refs already in the clone
 #   --no-wait        do not wait for in-flight claude turns (they are killed)
 #   --no-auth-probe  skip the claude auth probe
@@ -63,7 +70,7 @@
 #                    target fails, the code you had is swapped back in.
 #
 # Exit codes:
-#   0 deployed / rolled back (or dry run / build ok)
+#   0 deployed / rolled back / already live (or dry run / build ok)
 #   1 failed or interrupted before anything live changed (any git/npm/build
 #     failure maps here)
 #   2 usage
@@ -115,7 +122,7 @@ die() {
 }
 
 # ── arguments ──────────────────────────────────────────────────
-REV=""; DRY_RUN=0; BUILD_ONLY=0; FETCH=1; WAIT_IDLE=1; AUTH_PROBE=1; ROLLBACK=0; DETACH=0
+REV=""; DRY_RUN=0; BUILD_ONLY=0; FETCH=1; WAIT_IDLE=1; AUTH_PROBE=1; ROLLBACK=0; DETACH=0; FORCE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --sha) [ $# -ge 2 ] || die "--sha needs a revision" 2; REV="$2"; shift 2 ;;
@@ -123,6 +130,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1; shift ;;
     --build-only) BUILD_ONLY=1; shift ;;
     --detach) DETACH=1; shift ;;
+    --force) FORCE=1; shift ;;
     --no-fetch) FETCH=0; shift ;;
     --no-wait) WAIT_IDLE=0; shift ;;
     --no-auth-probe) AUTH_PROBE=0; shift ;;
@@ -131,8 +139,8 @@ while [ $# -gt 0 ]; do
     *) die "unknown argument: $1 (see --help)" 2 ;;
   esac
 done
-if [ "$ROLLBACK" = 1 ] && { [ -n "$REV" ] || [ "$BUILD_ONLY" = 1 ]; }; then
-  die "--rollback takes no --sha/--build-only" 2
+if [ "$ROLLBACK" = 1 ] && { [ -n "$REV" ] || [ "$BUILD_ONLY" = 1 ] || [ "$FORCE" = 1 ]; }; then
+  die "--rollback takes no --sha/--build-only/--force" 2
 fi
 if [ "$DETACH" = 1 ] && [ "$DRY_RUN" = 1 ]; then die "--detach makes no sense with --dry-run" 2; fi
 
@@ -152,6 +160,7 @@ RELAY_HOME="${RELAY_HOME:-$HOME/relay}"
 RELAY_PREV="${RELAY_PREV:-$RELAY_HOME.prev}"
 RELAY_PREV_OLD="$RELAY_PREV.old"
 RELAY_NEXT="$RELAY_HOME.next"
+RELAY_NEXT_PARTIAL="$RELAY_NEXT.partial"
 SWAP_TMP="$RELAY_HOME.swap"
 LOG="$(plist_get StandardOutPath)"
 ERR_LOG="$(plist_get StandardErrorPath)"
@@ -197,6 +206,11 @@ revision_of() {
   local sha=""
   [ -f "$1/REVISION" ] && sha="$(awk '/^sha=/ { print substr($0, 5); exit }' "$1/REVISION")"
   echo "${sha:-unrecorded}"
+}
+# revision_of, readable in messages
+rev_label() {
+  local r; r="$(revision_of "$1")"
+  if [ "$r" = unrecorded ]; then echo "the code from before this script"; else echo "$r"; fi
 }
 # ok | staged | failed | unknown, or "unrecorded" for code without REVISION
 # (live before this script existed).
@@ -279,19 +293,33 @@ check_layout() {
   fi
   if [ -e "$RELAY_PREV_OLD" ]; then
     if [ -f "$RELAY_PREV/$OWNED" ]; then
-      if [ "$DRY_RUN" = 1 ]; then say "would remove $RELAY_PREV_OLD (older backup left by an interrupted cleanup)"
-      else say "removing $RELAY_PREV_OLD (older backup left by an interrupted cleanup)"; discard_dir "$RELAY_PREV_OLD"; fi
+      # An older rollback target kept while a deploy ran; <live>.prev is the
+      # newer one and stays.
+      if [ "$DRY_RUN" = 1 ]; then say "would remove $RELAY_PREV_OLD (an older rollback target left by an interrupted deploy; $RELAY_PREV stays)"
+      else say "removing $RELAY_PREV_OLD (an older rollback target left by an interrupted deploy; $RELAY_PREV stays)"; discard_dir "$RELAY_PREV_OLD"; fi
+    elif [ ! -e "$RELAY_PREV" ] && [ ! -e "$RELAY_NEXT" ]; then
+      # Cut off just before the older rollback target was put back: put it back.
+      if [ "$DRY_RUN" = 1 ]; then say "would rename $RELAY_PREV_OLD back to $RELAY_PREV (an interrupted deploy had not put it back yet)"
+      else say "renaming $RELAY_PREV_OLD back to $RELAY_PREV (an interrupted deploy had not put it back yet)"; mv "$RELAY_PREV_OLD" "$RELAY_PREV"; fi
     else
-      say "found $RELAY_PREV_OLD but no $RELAY_PREV: an earlier deploy was cut off between renames; if $RELAY_NEXT holds the code that was live, rename it to $RELAY_PREV, else rename $RELAY_PREV_OLD to $RELAY_PREV"
+      say "found $RELAY_PREV_OLD (an older rollback target) but no $RELAY_PREV: an earlier deploy was killed between the swap and keeping the code that was live ($RELAY_NEXT)"
+      say "  to keep the code that was live as the rollback target: mv $RELAY_NEXT $RELAY_PREV && rm -rf $RELAY_PREV_OLD"
+      say "  to keep the older one instead: mv $RELAY_PREV_OLD $RELAY_PREV && rm -rf $RELAY_NEXT"
       problems=1
     fi
   fi
-  if [ -e "$RELAY_NEXT" ]; then
+  if [ -e "$RELAY_NEXT_PARTIAL" ]; then
+    if [ "$DRY_RUN" = 1 ]; then say "would remove $RELAY_NEXT_PARTIAL (staging that was cut off; it never went live)"
+    else say "removing $RELAY_NEXT_PARTIAL (staging that was cut off; it never went live)"; discard_dir "$RELAY_NEXT_PARTIAL"; fi
+  fi
+  if [ -e "$RELAY_NEXT" ] && [ ! -e "$RELAY_PREV_OLD" ]; then
     if [ -f "$RELAY_NEXT/$OWNED" ] && [ "$(status_of "$RELAY_NEXT")" = staged ]; then
       if [ "$DRY_RUN" = 1 ]; then say "would remove $RELAY_NEXT (a staged build that never went live)"
       else say "removing $RELAY_NEXT (a staged build that never went live)"; discard_dir "$RELAY_NEXT"; fi
     else
-      say "found $RELAY_NEXT holding code that is not a staged build (status $(status_of "$RELAY_NEXT")): an earlier swap was cut off; inspect it"
+      say "found $RELAY_NEXT holding the code that was live before an earlier deploy (revision $(revision_of "$RELAY_NEXT"), status $(status_of "$RELAY_NEXT")); that deploy was killed right after its swap"
+      say "  live now: $(revision_of "$RELAY_HOME") (status $(status_of "$RELAY_HOME")); rollback target: $( [ -e "$RELAY_PREV" ] && echo "$(revision_of "$RELAY_PREV") (status $(status_of "$RELAY_PREV"))" || echo none)"
+      say "  to make it the rollback target: rm -rf $RELAY_PREV && mv $RELAY_NEXT $RELAY_PREV; to drop it: rm -rf $RELAY_NEXT"
       problems=1
     fi
   fi
@@ -488,7 +516,9 @@ on_exit() {
       probe:0|probe:3|probe:4|probe:5) ;;
       probe:*) say "deployed; the auth probe did not complete (exit $rc)"; rc=3 ;;
     esac
-    if [ "$PHASE" = prepare ] && [ "$STAGED_NEXT" = 1 ]; then discard_dir "$RELAY_NEXT" || true; fi
+    if [ "$PHASE" = prepare ] && [ "$STAGED_NEXT" = 1 ]; then
+      discard_dir "$RELAY_NEXT_PARTIAL" || true; discard_dir "$RELAY_NEXT" || true
+    fi
     if [ -n "$BUILD" ] && [ "$BUILD_ONLY" = 0 ]; then rm -rf "$BUILD" || true; fi
     mkdir -p "$BUILD_ROOT" 2>/dev/null || true
     printf '%s exit %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rc" "$SUMMARY" >> "$BUILD_ROOT/history.log" 2>/dev/null || true
@@ -584,6 +614,13 @@ if [ "$DRY_RUN" = 1 ]; then
   if check_layout; then say "layout:    clean"; else say "layout:    the real run would REFUSE (see above)"; fi
   say "repo:      $RELAY_REPO (remote $REMOTE; work tree untouched)"
   say "target:    $REV = $SHA $SHA_NOTE"
+  if [ "$(revision_of "$RELAY_HOME")" = "$SHA" ]; then
+    if [ "$(status_of "$RELAY_HOME")" = ok ] && [ "$FORCE" = 0 ]; then
+      say "note:      $SHA is already live (status ok): the real run only runs the auth probe (--force rebuilds and restarts)"
+    else
+      say "note:      $SHA is already live (status $(status_of "$RELAY_HOME")): the real run redeploys it and keeps $RELAY_PREV as the rollback target"
+    fi
+  fi
   say "build dir: $BUILD_ROOT/build-$SHA"
   say "free disk: $(df -k "$HOME" | awk 'NR==2 {printf "%.1f GB", $4/1048576}')"
   say "plan:"
@@ -617,6 +654,17 @@ SHA="$(git -C "$RELAY_REPO" rev-parse --verify --quiet "$REV^{commit}")" || die 
 SUBJECT="$(git -C "$RELAY_REPO" log -1 --format=%s "$SHA")" || die "git log failed"
 SUMMARY="deploy $SHA (previous $(revision_of "$RELAY_HOME"))"
 say "target: $REV = $SHA ($SUBJECT)"
+
+if [ "$(revision_of "$RELAY_HOME")" = "$SHA" ] && [ "$(status_of "$RELAY_HOME")" = ok ] && [ "$FORCE" = 0 ] && [ "$BUILD_ONLY" = 0 ]; then
+  SUMMARY="deploy $SHA: already live"
+  say "already live: $SHA passed its smoke test; nothing to deploy, $RELAY_PREV kept as is (--force rebuilds and restarts)"
+  PHASE=probe
+  if [ "$AUTH_PROBE" = 1 ] && ! auth_probe; then
+    SUMMARY="$SUMMARY, AUTH PROBE FAILED"
+    die "$SHA is live, but the claude auth probe failed (see above). An auth error means Chuck cannot answer until the token is refreshed (infra/set-claude-token.sh); a timeout points at the network." 3
+  fi
+  exit 0
+fi
 
 avail_kb="$(df -k "$BUILD_ROOT" | awk 'NR==2 {print $4}')"
 [ "${avail_kb:-0}" -gt 1048576 ] || die "less than 1 GB free under $BUILD_ROOT"
@@ -656,45 +704,62 @@ for item in $REQUIRED_BUILD_ITEMS; do [ -e "$NEW/$item" ] || die "build lacks $i
   echo "node=$("$NODE" --version)"
   echo "status=staged"
 } > "$NEW/REVISION"
-mkdir "$RELAY_NEXT"; STAGED_NEXT=1
-: > "$RELAY_NEXT/$OWNED"
+mkdir "$RELAY_NEXT_PARTIAL"; STAGED_NEXT=1
+: > "$RELAY_NEXT_PARTIAL/$OWNED"
 for item in $CODE_ITEMS; do
-  if [ -e "$NEW/$item" ]; then mv "$NEW/$item" "$RELAY_NEXT/$item"; fi
+  if [ -e "$NEW/$item" ]; then mv "$NEW/$item" "$RELAY_NEXT_PARTIAL/$item"; fi
 done
+mv "$RELAY_NEXT_PARTIAL" "$RELAY_NEXT"          # complete: a .next is always a whole staged build
 rm -rf "$BUILD"; BUILD=""
-FROM_REV="$(revision_of "$RELAY_HOME")"
+FROM_REV="$(rev_label "$RELAY_HOME")"
 say "staged $SHA in $RELAY_NEXT"
 
 # ── swap + activate (signals ignored from here) ────────────────
 enter_critical
 swap_code "$RELAY_NEXT"                         # live = new build; .next = code that was live
 STAGED_NEXT=0
+# What becomes of the code that was live (now in <live>.next):
+#   rotated  proven, other commit: it becomes <live>.prev; the old .prev
+#            waits in .prev.old until the outcome is known;
+#   same     proven, same commit (--force): rotated too, so a failed restart
+#            reverts to it, but on success the old .prev comes back (a copy
+#            of the live commit is no rollback target);
+#   dropped  never passed a smoke test: dropped; the proven .prev stays.
 if rollbackable "$RELAY_NEXT"; then
-  # The code that was live had proven itself: it becomes the rollback target.
+  FATE=rotated; [ "$(revision_of "$RELAY_NEXT")" = "$SHA" ] && FATE=same
   if [ -e "$RELAY_PREV" ]; then mv "$RELAY_PREV" "$RELAY_PREV_OLD"; fi
   mv "$RELAY_NEXT" "$RELAY_PREV"
 else
-  # The code that was live never passed a smoke test (an earlier deploy was
-  # killed): keep the proven <live>.prev as the rollback target instead.
+  FATE=dropped
   say "the code that was live ($FROM_REV) has status '$(status_of "$RELAY_NEXT")'; dropping it and keeping $RELAY_PREV as the rollback target"
   discard_dir "$RELAY_NEXT"
 fi
-say "swapped: live = $SHA; rollback target: $(revision_of "$RELAY_PREV") (status $(status_of "$RELAY_PREV")) in $RELAY_PREV"
+REVERT_REV="$(rev_label "$RELAY_PREV")"; HAD_REVERT=0; [ -e "$RELAY_PREV" ] && HAD_REVERT=1
+say "swapped: live = $SHA; revert target if the smoke test fails: $( [ -e "$RELAY_PREV" ] && echo "$REVERT_REV (status $(status_of "$RELAY_PREV"))" || echo none)"
 
 rc=0; activate || rc=$?
 if [ "$rc" = 0 ]; then
-  discard_dir "$RELAY_PREV_OLD"
+  if [ "$FATE" = same ]; then
+    discard_dir "$RELAY_PREV"
+    if [ -e "$RELAY_PREV_OLD" ]; then mv "$RELAY_PREV_OLD" "$RELAY_PREV"; fi
+  else
+    discard_dir "$RELAY_PREV_OLD"
+  fi
 else
-  # The new build is in <live>.prev now: drop it and put the older rollback
-  # target back, so a failed deploy leaves everything as it was.
+  # The failed build is in <live>.prev now: drop it, and put the older
+  # rollback target back where there is one.
   discard_dir "$RELAY_PREV"
   if [ -e "$RELAY_PREV_OLD" ]; then mv "$RELAY_PREV_OLD" "$RELAY_PREV"; fi
 fi
 leave_critical
-case "$rc" in
-  0) ;;
-  4) die "deploy of $SHA failed its smoke test; $FROM_REV is live again and $RELAY_PREV is as before" 4 ;;
-  *) down_checklist; die "deploy of $SHA failed and the previous code ($FROM_REV) did not come up either" 5 ;;
+case "$rc:$FATE" in
+  0:*) ;;
+  4:dropped) die "deploy of $SHA failed its smoke test; the rollback target $REVERT_REV is live; the unproven code that was live before ($FROM_REV) was dropped, so there is no rollback target now" 4 ;;
+  4:*) die "deploy of $SHA failed its smoke test; $FROM_REV is live again and $RELAY_PREV is as before" 4 ;;
+  *) if [ "$HAD_REVERT" = 0 ]; then
+       die "deploy of $SHA failed its smoke test and there was no proven code to revert to; $SHA stays live. Check the cause (network, Discord, .env, $ERR_LOG), then re-run the deploy" 5
+     fi
+     down_checklist; die "deploy of $SHA failed and the code it reverted to ($REVERT_REV) did not come up either" 5 ;;
 esac
 
 if [ "$AUTH_PROBE" = 1 ] && ! auth_probe; then
