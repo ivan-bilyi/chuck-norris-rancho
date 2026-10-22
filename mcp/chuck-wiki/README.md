@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server that exposes Chuck's Obsidian vault (`chuck-norris-wiki`) to Claude Code sessions — read + contribute.
 
-Spec: [chuck-norris-agent/PRODUCT.md §3.2, §6.3](https://github.com/ivanbeliy/chuck-norris-agent/blob/main/PRODUCT.md).
+Spec: [chuck-norris-agent/PRODUCT.md §3.2, §6.3](https://github.com/ivan-bilyi/chuck-norris-agent/blob/main/PRODUCT.md).
 
 ## Tools
 
