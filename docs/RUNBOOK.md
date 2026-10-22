@@ -173,63 +173,104 @@ the code, so `~/relay` always runs a known commit. There is no laptop-side deplo
 working tree to the host ships uncommitted or unmerged code and leaves no record of what runs.
 
 ```bash
-# plan only: current state, target SHA, what moves and what stays (changes nothing)
+# plan only: current state, leftovers, target SHA, what moves and what stays (changes nothing)
 ssh rancho 'cd ~/chuck-norris-rancho && git pull --ff-only && scripts/relay-deploy.sh --dry-run'
 
-# deploy origin/main (or: --sha <rev>)
-ssh rancho 'cd ~/chuck-norris-rancho && git pull --ff-only && scripts/relay-deploy.sh'
+# deploy origin/main (or: --sha <rev>) in the background; safe to disconnect
+ssh rancho 'cd ~/chuck-norris-rancho && git pull --ff-only && scripts/relay-deploy.sh --detach'
+ssh rancho 'tail -n 20 ~/.cache/relay-deploy/last-run.log'   # repeat until "relay-deploy: finished: exit <code>"
 
 # what is deployed
 ssh rancho 'cat ~/relay/REVISION'
 
-# roll back to the previous code (run it again to return)
-ssh rancho '~/chuck-norris-rancho/scripts/relay-deploy.sh --rollback'
+# roll back to the previous code (run it again to return); --detach works here too
+ssh rancho '~/chuck-norris-rancho/scripts/relay-deploy.sh --rollback --detach'
 ```
+
+`--detach` restarts the script under `nohup` with its output in
+`~/.cache/relay-deploy/last-run.log` and returns at once. A foreground run is also safe: from
+the swap to the end of the smoke test (and any revert) the script ignores HUP, INT and TERM
+and keeps going if its output is gone, so Ctrl-C or a dropped SSH session cannot leave a
+half-done deploy. Before the swap, an interrupted run changes nothing live. To watch a
+foreground run without tying it to the SSH session, `screen` is available on the host;
+`tmux` is not installed.
 
 What the script does:
 
-1. `git fetch` in the clone (refs only; the clone's work tree is not touched), then
+1. It checks for leftovers of an interrupted earlier run (`~/relay.swap`, `~/relay.next`,
+   `~/relay.prev.old`, a `~/relay.prev` it did not make). It deletes only what never went live
+   and refuses, before changing anything, when a leftover may hold code that ran.
+2. `git fetch` in the clone (refs only; the clone's work tree is not touched), then
    `git archive <sha> relay/` into a fresh build dir under `~/.cache/relay-deploy/`.
-2. `npm ci` and `npm run build` there with the node binary named in the launchd plist, then it
+3. `npm ci` and `npm run build` there with the node binary named in the launchd plist, then it
    loads every dependency under that node. Native modules must match the node that runs Relay.
-3. It waits until Relay has no `claude` child process (no turn in flight; `--no-wait` skips this).
-4. It moves the live **code** items (`dist node_modules package.json package-lock.json REVISION
-   src tsconfig.json CLAUDE.md relay.env.example templates`) to `~/relay.prev` and moves the
-   new build in. These are renames on one volume.
-5. `launchctl kickstart -k gui/<uid>/com.rancho.relay`, or `launchctl bootstrap` with the plist when the service is not loaded. Then a smoke test:
+4. It stages the build in `~/relay.next`, then waits until Relay has no `claude` child process
+   (no turn in flight; up to 15 minutes; `--no-wait` skips this).
+5. From here signals are ignored. It re-checks that no turn started meanwhile (if one did, it
+   waits again). Then it swaps the live **code** items (`dist node_modules package.json
+   package-lock.json REVISION src tsconfig.json CLAUDE.md relay.env.example templates`) with
+   the staged ones by renames on one volume. The code that was live becomes `~/relay.prev`, the
+   rollback target. If that code had itself never passed a smoke test (an earlier run was
+   killed), it is dropped and the existing `~/relay.prev` stays the rollback target.
+6. `launchctl kickstart -k gui/<uid>/com.rancho.relay`, or `launchctl bootstrap` with the
+   plist when the service is not loaded. Then a smoke test:
    - a new pid is running;
    - the log shows `Relay online as` (Discord ready) and `Reconcile scheduler started`;
    - `GET 127.0.0.1:<RELAY_NOTIFY_PORT>/healthz` answers 200;
-   - the pid stays up for 10 s;
-   - a one-line `claude -p` auth probe on Haiku runs with Relay's own token.
-6. If a service check fails, it swaps the previous code back and restarts again (exit 4).
-   `~/relay.prev` then holds the failed build, marked so that `--rollback` refuses it.
-   A failed auth probe does not roll back, because rolling back would not fix auth. The run
-   exits 3: refresh the token with `infra/set-claude-token.sh`.
+   - the pid stays up for 10 s.
+
+   A fatal start error in the error log (`Failed to start bot`, a missing bot token) or the
+   process going away fails the test at once instead of waiting for the 90 s timeout.
+7. If the smoke test fails, it swaps the previous code back, restarts and smoke-tests again.
+   It drops the new build and puts the old `~/relay.prev` back, so after exit 4 everything is
+   as it was.
+8. A one-line `claude -p` auth probe on Haiku runs with Relay's own token, with a 120 s timeout.
+   A failed probe does not roll back, because rolling back would not change auth or the
+   network. The run exits 3: refresh the token (see Claude CLI errors) or check the network.
 
 Never touched: `.env*`, `relay.db*`, `logs/` and anything else in `~/relay` that is not a code
-item. The script reads only the log and two `.env` settings: `RELAY_NOTIFY_PORT`, and
+item. The script reads only the logs and two `.env` settings: `RELAY_NOTIFY_PORT`, and
 `CLAUDE_CODE_OAUTH_TOKEN`, which is passed to the auth probe through its environment and never printed.
 
-`~/relay/REVISION` is the deploy record. Its format is `key=value` lines: `sha`, `ref`,
-`subject`, `deployed_at` (UTC), `node`. It moves with the code, so after a rollback it names
-what actually runs. A missing file means the live code was not deployed by this script. Each
-run appends one line to `~/.cache/relay-deploy/history.log`.
+Each code set records itself in its `REVISION` file as `key=value` lines: `sha`, `ref`,
+`subject`, `deployed_at` (UTC), `node`, and `status`:
+- `staged`: built, not yet proven;
+- `ok`: passed its smoke test;
+- `failed`: failed it while the other code came up.
 
-Exit codes:
+`REVISION` moves with its code, so `~/relay/REVISION` names what actually runs. Code without a
+`REVISION` is code that was live before this script existed. `--rollback` accepts a
+`~/relay.prev` whose status is `ok`, or that has no `REVISION`, and refuses anything else.
+
+Each run writes its lines to `~/.cache/relay-deploy/last-run.log`, ending with
+`relay-deploy: finished: exit <code>`, and appends one line to `~/.cache/relay-deploy/history.log`.
+A lock (`~/.cache/relay-deploy/lock`, holding the pid) keeps runs from overlapping. A lock left
+by a run that no longer exists is removed automatically.
+
+Exit codes (every failure maps to one of these; git or npm errors do not pass their own codes through):
 
 | Code | Meaning |
 |---|---|
-| 0 | deployed |
-| 1 | failed before anything live changed |
+| 0 | deployed or rolled back |
+| 1 | failed or interrupted before anything live changed, including any git/npm/build error |
 | 2 | usage error |
-| 3 | deployed, but the auth probe failed |
-| 4 | smoke test failed and the previous code is live again |
-| 5 | smoke test failed and the revert did not come up either: check the service by hand |
+| 3 | deployed, but the auth probe failed or timed out |
+| 4 | smoke test failed; the code that was live before is live again, `~/relay.prev` as before |
+| 5 | smoke test failed and the previous code did not come up either |
+| 6 | the swap itself failed midway (filesystem error); the message names the dirs to inspect |
+
+Exit 5 usually means the cause is outside the code: network, DNS, Discord, or `.env`. The
+message lists what to check, in order:
+1. `curl -sS -m 5 -o /dev/null -w '%{http_code}\n' https://discord.com/api/v10/gateway` (expect 200);
+2. `launchctl print gui/<uid>/com.rancho.relay`;
+3. the newest lines of `~/relay/logs/relay.error.log` and `relay.log`;
+4. that `~/relay/.env` sets `DISCORD_BOT_TOKEN`.
+
+Once the cause is fixed, `launchctl kickstart -k` the service and re-run the deploy.
 
 Paths and the label come from the launchd plist and `$HOME`. They can be overridden with
 `RELAY_*` variables (see the script header). Other flags: `--build-only`, `--no-fetch`,
-`--no-auth-probe`.
+`--no-wait`, `--no-auth-probe`.
 
 ## Vitrina (self-hosted artifacts)
 

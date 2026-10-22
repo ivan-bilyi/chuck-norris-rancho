@@ -26,7 +26,7 @@ Relay is a dumb pipe. All intelligence lives inside native Claude Code CLI sessi
 2. From Windows: `bash scripts/setup-ssh.sh mac <TAILSCALE_IP>`
 3. Deploy: `scp infra/setup-mac.sh rancho:/tmp/ && ssh rancho 'bash /tmp/setup-mac.sh'`
 4. Configure: `ssh rancho "claude setup-token"` + fill `DISCORD_BOT_TOKEN` in `~/relay/.env`
-5. Deploy Relay on the Mac, from the repo clone there: `ssh rancho 'cd ~/chuck-norris-rancho && git pull --ff-only && scripts/relay-deploy.sh'`
+5. Deploy Relay on the Mac, from the repo clone there: `ssh rancho 'cd ~/chuck-norris-rancho && git pull --ff-only && scripts/relay-deploy.sh --detach'`, then follow `~/.cache/relay-deploy/last-run.log` (see [RUNBOOK](docs/RUNBOOK.md#relay-deploy))
 6. Test: `bash scripts/status.sh` + send Discord message
 
 ## Scripts
