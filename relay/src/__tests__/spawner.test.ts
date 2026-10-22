@@ -217,6 +217,81 @@ describe('spawnClaude', () => {
     expect(result.error).toContain('something went wrong');
   });
 
+  it('reports the message of a JSON error body, not the raw body', async () => {
+    const child = createFakeChild();
+    mockSpawn(child);
+
+    const promise = spawnClaude({
+      prompt: 'hello',
+      projectPath: '/tmp/proj',
+      claudeSessionId: 'session-abc',
+      skipPermissions: false,
+    });
+
+    // Shape of the CLI's output for an API/auth failure with --output-format json.
+    child.stdout.end(
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: true,
+        result: 'Failed to authenticate. API Error: 401 OAuth access token is invalid.',
+        session_id: 'other-session',
+      }),
+    );
+    child.emit('close', 1);
+
+    const result = await promise;
+    expect(result.success).toBe(false);
+    expect(result.error).toBe(
+      'Claude exited with code 1: Failed to authenticate. API Error: 401 OAuth access token is invalid.',
+    );
+    expect(result.error).not.toContain('session_id');
+    expect(result.claudeSessionId).toBe('session-abc');
+  });
+
+  it('treats is_error:true as a failure even with exit code 0', async () => {
+    const child = createFakeChild();
+    mockSpawn(child);
+
+    const promise = spawnClaude({
+      prompt: 'hello',
+      projectPath: '/tmp/proj',
+      claudeSessionId: 'session-abc',
+      skipPermissions: false,
+    });
+
+    child.stdout.end(
+      JSON.stringify({ is_error: true, result: 'API Error: 529 Overloaded', session_id: 'x' }),
+    );
+    child.emit('close', 0);
+
+    const result = await promise;
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('API Error: 529 Overloaded');
+    expect(result.claudeSessionId).toBe('session-abc');
+  });
+
+  it('passes the CLI "No conversation found" stderr text through', async () => {
+    const child = createFakeChild();
+    mockSpawn(child);
+
+    const promise = spawnClaude({
+      prompt: 'hello',
+      projectPath: '/tmp/proj',
+      claudeSessionId: 'session-abc',
+      skipPermissions: false,
+    });
+
+    child.stderr.end('No conversation found with session ID: session-abc\n');
+    child.emit('close', 1);
+
+    const result = await promise;
+    expect(result.success).toBe(false);
+    expect(result.error).toBe(
+      'Claude exited with code 1: No conversation found with session ID: session-abc',
+    );
+  });
+
   it('returns error on spawn error event', async () => {
     const child = createFakeChild();
     mockSpawn(child);

@@ -176,20 +176,20 @@ describe('handleMessage', () => {
     );
   });
 
-  it('retries with fresh session on session-related error', async () => {
-    const sessionError: spawner.SpawnResult = {
+  it('retries with a fresh session only on the explicit "no conversation found" error', async () => {
+    const deadSession: spawner.SpawnResult = {
       success: false,
       result: '',
       claudeSessionId: 'claude-1',
       costUsd: null,
-      error: 'session expired',
+      error: 'Claude exited with code 1: No conversation found with session ID: claude-1',
       peakRssKb: null,
       durationMs: 500,
       resumed: true,
     };
 
     vi.mocked(spawner.spawnClaude)
-      .mockResolvedValueOnce(sessionError)
+      .mockResolvedValueOnce(deadSession)
       .mockResolvedValueOnce(successResult);
 
     const msg = createFakeMessage();
@@ -198,13 +198,34 @@ describe('handleMessage', () => {
     // Should have been called twice
     expect(spawner.spawnClaude).toHaveBeenCalledTimes(2);
     // Second call should have null session
-    expect(spawner.spawnClaude).toHaveBeenCalledWith(
+    expect(spawner.spawnClaude).toHaveBeenLastCalledWith(
       expect.objectContaining({ claudeSessionId: null }),
     );
     // Session ID should have been cleared
     expect(db.updateSessionClaudeId).toHaveBeenCalledWith('sess-1', null);
     // Final result should be success
     expect(db.updateSessionStatus).toHaveBeenCalledWith('sess-1', 'idle');
+  });
+
+  it('keeps the session on errors that only mention "session" or "expired"', async () => {
+    const sessionish: spawner.SpawnResult = {
+      success: false,
+      result: '',
+      claudeSessionId: 'claude-1',
+      costUsd: null,
+      error: 'Claude exited with code 1: OAuth token has expired; session not found in cache',
+      peakRssKb: null,
+      durationMs: 500,
+      resumed: true,
+    };
+    vi.mocked(spawner.spawnClaude).mockResolvedValue(sessionish);
+
+    const msg = createFakeMessage();
+    await handleMessage(msg);
+
+    expect(spawner.spawnClaude).toHaveBeenCalledTimes(1);
+    expect(db.updateSessionClaudeId).not.toHaveBeenCalledWith('sess-1', null);
+    expect(db.updateSessionStatus).toHaveBeenCalledWith('sess-1', 'error');
   });
 
   it('includes referenced message context in prompt on reply', async () => {

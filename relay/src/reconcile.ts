@@ -3,12 +3,15 @@
  *
  * At RELAY_RECONCILE_CRON (default 03:00 daily) every registered project is
  * triaged:
- *   - fresh activity since the last successful reconcile -> spawn `/reconcile`
- *     in the project's live session (the session distills itself into
- *     .chuck/memory/), then close the session so the morning starts fresh;
- *   - session idle for more than STALE_DAYS -> close it without a run
- *     (nothing worth distilling);
- *   - everything else -> skip.
+ *   - a live session with activity not yet covered by a successful reconcile
+ *     (however old) -> spawn `/reconcile` in that session (the session distills
+ *     itself into .chuck/memory/), then close the session so the morning
+ *     starts fresh;
+ *   - everything else -> skip, leaving the session as it is.
+ *
+ * Memory safety: a session is only ever closed after a successful distill.
+ * A failed run keeps the session, and the next night tries again, because its
+ * activity is still newer than the last successful reconcile.
  *
  * Relay stays a dumb pipe: the prompt is the fixed string `/reconcile`; all
  * distillation logic lives in the reconcile skill on the Mac.
@@ -20,10 +23,8 @@ import * as router from './router.js';
 import * as notify from './notify.js';
 
 const DEFAULT_CRON = '0 3 * * *';
-const STALE_DAYS = 7;
-const DAY_MS = 24 * 60 * 60 * 1000;
 
-export type ReconcileAction = 'run' | 'close_stale' | 'skip';
+export type ReconcileAction = 'run' | 'skip';
 
 export interface ProjectFacts {
   reconcileEnabled: boolean;
@@ -39,24 +40,17 @@ export function parseSqliteUtc(ts: string): number {
   return Date.parse(ts.replace(' ', 'T') + 'Z');
 }
 
-export function decideAction(facts: ProjectFacts, now: Date): ReconcileAction {
+export function decideAction(facts: ProjectFacts): ReconcileAction {
   if (!facts.reconcileEnabled) return 'skip';
   if (!facts.hasClaudeSession) return 'skip';
+  // No logged activity: nothing known to distill. Keep the session as is.
+  if (!facts.lastActivityAt) return 'skip';
 
-  const activityMs = facts.lastActivityAt
-    ? parseSqliteUtc(facts.lastActivityAt)
-    : null;
-  const fresh =
-    activityMs !== null && now.getTime() - activityMs <= STALE_DAYS * DAY_MS;
-
-  if (!fresh) return 'close_stale';
-
-  const newSinceReconcile =
+  const undistilled =
     !facts.lastReconcileAt ||
-    parseSqliteUtc(facts.lastActivityAt!) >
-      parseSqliteUtc(facts.lastReconcileAt);
+    parseSqliteUtc(facts.lastActivityAt) > parseSqliteUtc(facts.lastReconcileAt);
 
-  return newSinceReconcile ? 'run' : 'skip';
+  return undistilled ? 'run' : 'skip';
 }
 
 function gatherFacts(project: db.Project): ProjectFacts {
@@ -89,7 +83,7 @@ export async function runNightly(): Promise<void> {
     // Sequential on purpose: one fat resumed session in memory at a time.
     for (const project of projects) {
       try {
-        const action = decideAction(gatherFacts(project), new Date());
+        const action = decideAction(gatherFacts(project));
 
         if (action === 'skip') {
           console.log(
@@ -98,22 +92,17 @@ export async function runNightly(): Promise<void> {
           continue;
         }
 
-        if (action === 'close_stale') {
-          const session = db.getSessionByProjectId(project.id);
-          if (session) {
-            db.updateSessionClaudeId(session.id, null);
-            db.updateSessionStatus(session.id, 'idle');
-          }
-          console.log(
-            `[${new Date().toISOString()}] Reconcile: ${project.name} — closed stale session without a run`,
-          );
-          continue;
-        }
-
         console.log(
           `[${new Date().toISOString()}] Reconcile: ${project.name} — running`,
         );
         const result = await router.handleReconcile(project);
+
+        if (!result) {
+          console.log(
+            `[${new Date().toISOString()}] Reconcile: ${project.name} — no live session any more, skip`,
+          );
+          continue;
+        }
 
         if (result.success) {
           const report = result.result.trim();
@@ -131,7 +120,7 @@ export async function runNightly(): Promise<void> {
           await notify
             .sendToProjectChannel(
               project.name,
-              `Nightly reconcile failed: ${result.error || 'unknown error'}. Session kept as is.`,
+              `Nightly reconcile failed: ${result.error || 'unknown error'}. Session kept; the next nightly run retries.`,
               'error',
             )
             .catch((err) =>

@@ -26,7 +26,7 @@ describe('decideAction', () => {
       reconcileEnabled: false,
       lastActivityAt: '2026-06-11 13:00:00',
     });
-    expect(decideAction(f, NOW)).toBe('skip');
+    expect(decideAction(f)).toBe('skip');
   });
 
   it('skips when there is no live claude session', () => {
@@ -34,12 +34,12 @@ describe('decideAction', () => {
       hasClaudeSession: false,
       lastActivityAt: '2026-06-11 13:00:00',
     });
-    expect(decideAction(f, NOW)).toBe('skip');
+    expect(decideAction(f)).toBe('skip');
   });
 
   it('runs when there is fresh activity and no reconcile yet', () => {
     const f = facts({ lastActivityAt: '2026-06-11 13:00:00' });
-    expect(decideAction(f, NOW)).toBe('run');
+    expect(decideAction(f)).toBe('run');
   });
 
   it('runs when fresh activity is newer than the last reconcile', () => {
@@ -47,7 +47,7 @@ describe('decideAction', () => {
       lastActivityAt: '2026-06-11 13:00:00',
       lastReconcileAt: '2026-06-10 03:00:00',
     });
-    expect(decideAction(f, NOW)).toBe('run');
+    expect(decideAction(f)).toBe('run');
   });
 
   it('skips when the last reconcile already covered the latest activity', () => {
@@ -55,22 +55,34 @@ describe('decideAction', () => {
       lastActivityAt: '2026-06-10 13:00:00',
       lastReconcileAt: '2026-06-11 03:00:00',
     });
-    expect(decideAction(f, NOW)).toBe('skip');
+    expect(decideAction(f)).toBe('skip');
   });
 
-  it('closes a stale session when activity is older than 7 days', () => {
-    const f = facts({ lastActivityAt: '2026-06-01 13:00:00' });
-    expect(decideAction(f, NOW)).toBe('close_stale');
+  it('runs (never closes) an old session whose activity was never distilled', () => {
+    // e.g. reconcile failed for more than a week in a row: the memory is
+    // still in the session, so distill it rather than drop it.
+    const f = facts({
+      lastActivityAt: '2026-06-01 13:00:00',
+      lastReconcileAt: '2026-05-20 03:00:00',
+    });
+    expect(decideAction(f)).toBe('run');
   });
 
-  it('closes a session that has no logged activity at all', () => {
+  it('keeps a session that has no logged activity at all', () => {
     const f = facts({ lastActivityAt: null });
-    expect(decideAction(f, NOW)).toBe('close_stale');
+    expect(decideAction(f)).toBe('skip');
   });
 
-  it('treats activity exactly at the 7-day boundary as fresh', () => {
-    const f = facts({ lastActivityAt: '2026-06-05 03:00:00' });
-    expect(decideAction(f, NOW)).toBe('run');
+  it('never returns an action that closes a session without a run', () => {
+    const cases: Partial<ProjectFacts>[] = [
+      { lastActivityAt: null },
+      { lastActivityAt: '2026-01-01 00:00:00' },
+      { lastActivityAt: '2026-01-01 00:00:00', lastReconcileAt: '2026-06-11 03:00:00' },
+      { lastActivityAt: '2026-06-11 13:00:00', lastReconcileAt: '2026-06-10 03:00:00' },
+    ];
+    for (const c of cases) {
+      expect(['run', 'skip']).toContain(decideAction(facts(c)));
+    }
   });
 });
 

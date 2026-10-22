@@ -74,6 +74,26 @@ function releaseSlot(): void {
   }
 }
 
+/**
+ * Readable failure text for a CLI run. With `--output-format json` an API or
+ * auth error comes back as a JSON result body on stdout (`is_error: true`,
+ * the message in `result`); other failures (e.g. an unknown `--resume` id)
+ * are plain text on stderr. Use the message, not the raw JSON body: the body
+ * carries unrelated fields such as `session_id`.
+ */
+function failureDetail(stdout: string, stderr: string): string {
+  let jsonMessage = '';
+  try {
+    const parsed = JSON.parse(stdout);
+    if (typeof parsed?.result === 'string') jsonMessage = parsed.result.trim();
+  } catch {
+    // stdout is not a JSON body
+  }
+  const detail =
+    [stderr.trim(), jsonMessage].filter(Boolean).join('\n') || stdout.trim();
+  return detail.slice(0, 2000);
+}
+
 function sampleRss(pid: number): Promise<number | null> {
   return new Promise((resolve) => {
     execFile('ps', ['-o', 'rss=', '-p', String(pid)], (err, stdout) => {
@@ -220,15 +240,30 @@ function spawnClaudeImpl(options: SpawnOptions): Promise<SpawnResult> {
       if (code === 0) {
         try {
           const parsed = JSON.parse(stdout);
-          out = {
-            success: true,
-            result: parsed.result || '(no result)',
-            claudeSessionId: parsed.session_id || options.claudeSessionId || '',
-            costUsd: parsed.total_cost_usd?.toString() || null,
-            peakRssKb: peak,
-            durationMs,
-            resumed,
-          };
+          out = parsed.is_error === true
+            ? {
+                // The CLI reported an API/auth error in its JSON body. That is
+                // a failure even with exit code 0: callers must not treat it
+                // as a completed turn (the nightly reconcile would close the
+                // session as if it had been distilled).
+                success: false,
+                result: '',
+                claudeSessionId: options.claudeSessionId || '',
+                costUsd: null,
+                error: `Claude reported an error: ${failureDetail(stdout, stderr)}`,
+                peakRssKb: peak,
+                durationMs,
+                resumed,
+              }
+            : {
+                success: true,
+                result: parsed.result || '(no result)',
+                claudeSessionId: parsed.session_id || options.claudeSessionId || '',
+                costUsd: parsed.total_cost_usd?.toString() || null,
+                peakRssKb: peak,
+                durationMs,
+                resumed,
+              };
         } catch {
           out = {
             success: true,
@@ -246,7 +281,7 @@ function spawnClaudeImpl(options: SpawnOptions): Promise<SpawnResult> {
           result: '',
           claudeSessionId: options.claudeSessionId || '',
           costUsd: null,
-          error: `Claude exited with code ${code}: ${(stderr || stdout).trim().slice(0, 2000)}`,
+          error: `Claude exited with code ${code}: ${failureDetail(stdout, stderr)}`,
           peakRssKb: peak,
           durationMs,
           resumed,

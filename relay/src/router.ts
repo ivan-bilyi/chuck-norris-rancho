@@ -494,9 +494,19 @@ export async function handleAutoReview(
 
 // ── Nightly reconcile (called by the reconcile scheduler) ────
 
+/**
+ * Distill one project's live session with the fixed prompt `/reconcile`, then
+ * close it. Returns null when the project has no live session.
+ *
+ * Memory safety: the live session is resumed exactly once. Reconcile never
+ * retries in a fresh session and never clears the session id after a failure
+ * (whatever the error text), so a failed night leaves the session as it was
+ * and the next nightly run tries again. The session is closed only after a
+ * successful distill.
+ */
 export async function handleReconcile(
   project: db.Project,
-): Promise<spawner.SpawnResult> {
+): Promise<spawner.SpawnResult | null> {
   const pp = project.project_path;
 
   // Wait until any user-message processing finishes. Poll cheaply; reconcile is not urgent.
@@ -506,17 +516,20 @@ export async function handleReconcile(
 
   processing.add(pp);
   try {
-    const session = db.getOrCreateSession(project.id);
+    const session = db.getSessionByProjectId(project.id);
+    const claudeSessionId = session?.claude_session_id ?? null;
+    if (!session || !claudeSessionId) return null;
+
     db.updateSessionStatus(session.id, 'running');
 
-    const result = await runWithRetry('/reconcile', project, session, 'reconcile');
-    updateSession(session, result);
+    const result = await spawnAndLog('/reconcile', project, claudeSessionId, 'reconcile');
 
     if (result.success) {
       // Close the session: the next message starts fresh, with the distilled
       // memory files in context via the project CLAUDE.md imports.
       db.updateSessionClaudeId(session.id, null);
     }
+    db.updateSessionStatus(session.id, result.success ? 'idle' : 'error');
 
     return result;
   } finally {
@@ -524,7 +537,33 @@ export async function handleReconcile(
   }
 }
 
-// ── Spawn with session-error retry ───────────────────────────
+// ── Dead-session detection ───────────────────────────────────
+
+/**
+ * The CLI's explicit answer when `--resume` names a conversation it does not
+ * have: "No conversation found with session ID: <id>" (stderr, exit 1).
+ */
+const NO_CONVERSATION_RE = /\bno conversation found\b/i;
+
+/**
+ * True only when a resumed spawn failed with the CLI's explicit
+ * "no conversation found" error. That is the one failure that proves the
+ * session is gone. Everything else (timeouts, 5xx, rate limits, auth errors,
+ * text that merely mentions "session" or "expired") is transient, and the
+ * session id must survive it.
+ */
+export function isDeadSessionError(
+  result: spawner.SpawnResult,
+  resumedSessionId: string | null,
+): boolean {
+  return (
+    !!resumedSessionId &&
+    !result.success &&
+    NO_CONVERSATION_RE.test(result.error ?? '')
+  );
+}
+
+// ── Spawn with dead-session retry (user messages, auto-review) ──
 
 async function runWithRetry(
   prompt: string,
@@ -532,38 +571,38 @@ async function runWithRetry(
   session: db.Session,
   kind: string,
 ): Promise<spawner.SpawnResult> {
+  const resumedId = session.claude_session_id;
+  const result = await spawnAndLog(prompt, project, resumedId, kind);
+
+  if (!isDeadSessionError(result, resumedId)) return result;
+
+  console.log(
+    `[${new Date().toISOString()}] The CLI has no conversation ${resumedId} for ${project.name}; starting a fresh session`,
+  );
+  db.updateSessionClaudeId(session.id, null);
+  return spawnAndLog(prompt, project, null, kind);
+}
+
+async function spawnAndLog(
+  prompt: string,
+  project: db.Project,
+  claudeSessionId: string | null,
+  kind: string,
+): Promise<spawner.SpawnResult> {
   const result = await spawner.spawnClaude({
     prompt,
     projectPath: project.project_path,
-    claudeSessionId: session.claude_session_id,
+    claudeSessionId,
     skipPermissions: project.skip_permissions,
     identity: project.identity,
     kind,
   });
   logSpawn(project.id, result, kind);
-
-  if (
-    !result.success &&
-    result.error &&
-    /session|expired|not found/i.test(result.error)
-  ) {
-    console.log(
-      `[${new Date().toISOString()}] Session error for ${project.name}, retrying with fresh session`,
+  if (!result.success) {
+    console.error(
+      `[${new Date().toISOString()}] ${kind} spawn failed for ${project.name}: ${(result.error || 'unknown error').split('\n')[0].slice(0, 300)}`,
     );
-    db.updateSessionClaudeId(session.id, null);
-
-    const retry = await spawner.spawnClaude({
-      prompt,
-      projectPath: project.project_path,
-      claudeSessionId: null,
-      skipPermissions: project.skip_permissions,
-      identity: project.identity,
-      kind,
-    });
-    logSpawn(project.id, retry, kind);
-    return retry;
   }
-
   return result;
 }
 

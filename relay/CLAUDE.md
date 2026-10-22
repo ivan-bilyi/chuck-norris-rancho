@@ -42,7 +42,12 @@ npm run dev     # run TypeScript directly with tsx (development)
 - Working directory for Claude is set via spawn `cwd` option, not a CLI flag
 - One task at a time per project (reject if busy)
 - Session resumed via `--resume <session_id>` for conversation continuity
-- Sessions are bounded: the nightly reconcile (default 03:00, `RELAY_RECONCILE_CRON`) resumes each active session one last time with the fixed prompt `/reconcile` (the skill on the Mac distills the conversation into the project's `.chuck/memory/` files), posts the skill's short report to the channel, and nulls `claude_session_id` so the morning starts fresh. Sessions idle for >7 days are closed without a run. Per-project opt-out: `/project reconcile <name> false`.
+- Sessions are bounded: the nightly reconcile (default 03:00, `RELAY_RECONCILE_CRON`) resumes each session that has activity not yet distilled, one last time, with the fixed prompt `/reconcile` (the skill on the Mac distills the conversation into the project's `.chuck/memory/` files). It posts the skill's short report to the channel and nulls `claude_session_id` so the morning starts fresh. Per-project opt-out: `/project reconcile <name> false`.
+- A session's memory is never dropped on a failure:
+  - A session id is cleared only when the CLI answers `--resume` with its explicit `No conversation found with session ID: <id>` (stderr, exit 1). On the user and auto-review paths Relay then retries once in a fresh session (`router.isDeadSessionError`). Timeouts, 5xx, rate limits, auth errors and any other text keep the session.
+  - The reconcile path resumes the session exactly once. It never retries in a fresh session and never clears the session after a failure, so the next night retries. The session is closed only after a successful distill.
+  - `spawner` treats a JSON result with `is_error: true` as a failure even on exit code 0, and reports the JSON `result` message, not the raw body.
+  - The regression test is `src/__tests__/session-survival.test.ts`. It injects faults at the `child_process` boundary.
 
 ## Key Constraints
 
