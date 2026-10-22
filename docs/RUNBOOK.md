@@ -130,7 +130,10 @@ OAuth token expired or rotated:
    - from the laptop clipboard: `pbpaste | ssh rancho '~/bin/set-claude-token.sh'`.
 
    The script refuses arguments. It writes `~/relay/.env` atomically with mode 0600, keeps a
-   0600 backup `.env.bak.<timestamp>`, and tightens older backups to 0600.
+   0600 backup `.env.bak.<timestamp>`, and tightens older backups to 0600. The verification
+   has a 120 s timeout (`RELAY_TOKEN_VERIFY_TIMEOUT`). If the script is interrupted, it
+   removes its temp file, which holds the token. It also says whether `.env` changed and
+   whether Relay still needs `launchctl kickstart -k`.
 
 ### Session stuck in "running" state
 
