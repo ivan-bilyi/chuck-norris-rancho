@@ -44,7 +44,10 @@ tailscale serve status                                          # inspect
 tailscale serve --bg --https=8444 http://127.0.0.1:4477         # tailnet-only mount (one-time)
 tailscale serve --https=8444 off                                # roll back
 ```
-(`tailscale` = `/Applications/Tailscale.app/Contents/MacOS/Tailscale` on the Mac.)
+(`tailscale` on the Mac is the daemon's CLI, `/opt/homebrew/bin/tailscale --socket=/var/run/tailscaled.socket`;
+while the GUI app still runs instead, it is `/Applications/Tailscale.app/Contents/MacOS/Tailscale`. See RUNBOOK
+"Tailscale daemon". Both mounts are declared in `infra/tailscaled/cutover.sh` (`SERVE_MOUNTS`), which
+re-creates them.)
 
 ## 3. Components
 

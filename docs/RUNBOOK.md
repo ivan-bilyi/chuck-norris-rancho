@@ -46,7 +46,7 @@ Setup: `bash scripts/setup-ssh.sh mac <TAILSCALE_IP>`
 2. System Settings -> Users & Groups -> **Automatic Login** -> select user
 3. System Settings -> Energy Saver -> **Prevent sleep**, **Wake for network**, **Auto restart after power failure**
 4. Install Homebrew: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
-5. Install Tailscale: `brew install --cask tailscale` -> log in -> `tailscale up --ssh`
+5. Tailscale: `brew install tailscale`, clone this repo, then `sudo bash infra/tailscaled/cutover.sh --hostname <name>` and approve the login URL it prints (see [Tailscale daemon](#tailscale-daemon))
 
 ### Automated Setup (via SSH)
 
@@ -319,12 +319,142 @@ ssh rancho 'launchctl kickstart -k gui/$(id -u)/com.rancho.vitrina'
 ssh rancho 'vitrina list'
 ssh rancho 'vitrina revoke <slug>'
 
-# funnel / tailnet mounts
-ssh rancho '/Applications/Tailscale.app/Contents/MacOS/Tailscale serve status'
+# funnel / tailnet mounts (the daemon's CLI; see Tailscale daemon)
+ssh rancho '/opt/homebrew/bin/tailscale --socket=/var/run/tailscaled.socket serve status'
+# while the GUI app still runs instead: /Applications/Tailscale.app/Contents/MacOS/Tailscale serve status
 ```
 
 Config: `~/.config/rancho/vitrina.env` (token, ports, base URLs), `~/.config/rancho/vitrina.json`
 (people + audiences + portal tokens). Data: `~/vitrina/data/` (back up with the Relay db).
+
+## Tailscale daemon
+
+The Mac's Tailscale node should be the open-source `tailscaled`, run as a system LaunchDaemon. It
+starts at boot, before anyone logs in. The standalone GUI app (bundle `io.tailscale.ipn.macsys`, a
+system network extension) connects only inside a logged-in GUI session, and after a reboot it can
+come back "Stopped". That takes down the tailnet path and anything bound to the tailnet address.
+`infra/tailscaled/cutover.sh` moves the host from the app to the daemon, and `--rollback` moves it
+back.
+
+### What runs
+
+- Installed with upstream's `tailscaled install-system-daemon`, run from the Homebrew formula
+  `tailscale`. It copies the binary to `/usr/local/bin/tailscaled` and writes
+  `/Library/LaunchDaemons/com.tailscale.tailscaled.plist` with `RunAtLoad`. State lives in
+  `/Library/Tailscale/tailscaled.state`; the CLI socket is `/var/run/tailscaled.socket`.
+- CLI: `/opt/homebrew/bin/tailscale --socket=/var/run/tailscaled.socket <command>`. The login user is
+  the daemon's operator, so no sudo is needed. **Always pass `--socket`.** Without it, the CLI on
+  macOS talks to the GUI app's backend whenever that backend answers.
+- Prefs: `--accept-routes --accept-dns --operator=<login user> --hostname=<name>`. No exit node,
+  no advertised routes, no Tailscale SSH.
+- Serve/funnel: port 443 is public through Funnel, and port 8444 is tailnet-only; both serve
+  `/` from `http://127.0.0.1:4477` (Vitrina). They are declared in `SERVE_MOUNTS` at the top of the
+  script, and the script re-creates them whenever the node's config differs.
+- With `--accept-dns` the daemon writes `/etc/resolver/<tailnet suffix>` for MagicDNS. When the
+  tailnet overrides local DNS, it also installs a global resolver through SystemConfiguration.
+  This host serves the LAN's DNS, so check `scutil --dns` after a change.
+
+### Before the cutover
+
+1. **Nothing may bind the tailnet address.** During the cutover the address disappears, and a
+   process bound to it fails: AdGuard crash-loops and the LAN falls back to unfiltered DNS. Its
+   web UI must bind `127.0.0.1` or the wildcard address. That change lives in the homelab repo.
+   `--preflight` lists such processes, and the cutover refuses to start while any are left.
+2. The Homebrew formula is installed, as the login user (brew refuses root):
+   `eval "$(/opt/homebrew/bin/brew shellenv)"; brew install tailscale`. If Homebrew has no bottle
+   for the running macOS version, it builds from source with the Go toolchain. That is slow, but
+   it works.
+3. An SSH session over the LAN (by the host's `.local` name), not over the tailnet: the tailnet
+   path drops during the cutover.
+4. Daytime, and a browser signed in to the tailnet's admin account, to approve the login URL and
+   to do the admin-console steps.
+
+### Cutover, in order
+
+Every script command needs root: the person with the sudo password runs it. The orchestrating
+session reads the log, which the login user owns.
+
+1. **Preflight** (changes nothing):
+   `cd ~/chuck-norris-rancho && git pull --ff-only && sudo bash infra/tailscaled/cutover.sh --preflight`.
+   It must end in `READY`. It saves the current serve config to
+   `~/.cache/tailscaled-cutover/serve-config-<UTC>.json` and prints the GUI node's name and IPv4.
+   Note the IPv4.
+2. **Cutover**, detached so that a dropped session cannot stop it:
+   `sudo bash infra/tailscaled/cutover.sh --hostname <name> --detach`, then
+   `tail -f ~/.cache/tailscaled-cutover/last-run.log`. In order, it disconnects the app, turns off
+   the app's start on login, quits the app, installs the daemon, runs `tailscale up` and
+   re-creates serve/funnel. Use the old machine name for `<name>`.
+3. **Approve the node.** The log shows `LOGIN NEEDED` and a login URL in a banner. Open it and
+   sign in with the account that owns the old node. The script waits for up to 15 minutes
+   (`TS_CUTOVER_LOGIN_TIMEOUT`, passed as `sudo TS_CUTOVER_LOGIN_TIMEOUT=<s> bash …`). If the
+   tailnet requires device approval, approve the machine in the admin console as well.
+4. The log shows `verified: daemon Running at boot …` and ends with `finished: exit 0`. The new
+   node is up, but it is registered under a new name (`<name>-1`) and a new IPv4.
+5. **Admin console**, on the tailnet admin's side:
+   1. Delete the old node: the GUI app's node, now offline, under the old name.
+   2. Rename the new node to the old name: Edit machine name, with the name no longer generated
+      from the OS hostname.
+   3. Edit its IPv4 back to the old address noted in step 1. SSH config, links and DNS settings
+      that use the address keep working.
+   4. Disable key expiry for the node, so it never needs another login.
+6. **Re-run the cutover command** (same arguments). A node's serve config is keyed by its DNS name,
+   so after the rename the script re-creates the mounts under the restored name, then verifies.
+   A second re-run changes nothing.
+7. **Check from outside the host:** `ssh` over the tailnet reaches the old address, Vitrina's public
+   Funnel URL opens from a phone off Wi-Fi, `:8444` opens from a tailnet device, and AdGuard
+   answers (`dig @127.0.0.1 example.com`).
+8. Later, a reboot with nobody logged in proves the point: the daemon comes up `Running` with no
+   login. A reboot is a separate action that needs the owner's go.
+
+Re-running is safe at any stage. Each step checks first and acts only on drift. When a run fails
+it stops, says what failed and prints the rollback command. The output also says whether anything
+on the host had changed.
+
+### Rollback
+
+`sudo bash infra/tailscaled/cutover.sh --rollback --detach`, over the LAN. In order, it runs
+`tailscaled uninstall-system-daemon` (stop, unload, remove the plist and the
+`/usr/local/bin/tailscaled` copy), runs `tailscaled --cleanup`, turns the app's start on login
+back on, launches the app in the login user's GUI session, runs
+`up --reset --accept-routes --accept-dns`, checks the serve mounts and verifies.
+
+- The app starts only inside a GUI session. If nobody is logged in, log in on the console or over
+  Screen Sharing, open Tailscale, and re-run `--rollback`.
+- If the old node was already deleted in the admin console, the app logs in again: the log shows
+  the login URL. The app then registers as a new node, so rename it and set its IPv4 as in step 5.
+- The daemon's state file stays. A later cutover reuses the daemon's node.
+
+### Operating the daemon
+
+```bash
+tailscale --socket=/var/run/tailscaled.socket status          # operator: no sudo
+tailscale --socket=/var/run/tailscaled.socket serve status
+sudo launchctl print system/com.tailscale.tailscaled          # state, pid, last exit code
+sudo launchctl kickstart -k system/com.tailscale.tailscaled   # restart (the tailnet drops briefly)
+```
+
+- **Upgrade:** `brew upgrade tailscale` updates the CLI only. The daemon runs its own copy in
+  `/usr/local/bin`. To move the daemon to the new version, run
+  `sudo /opt/homebrew/bin/tailscaled install-system-daemon` over the LAN. It restarts the
+  daemon and keeps the state and the serve config. Then re-run the cutover command to verify.
+- **Residual risk:** upstream's plist has `RunAtLoad` but no `KeepAlive`. If `tailscaled` crashes,
+  it stays down until the next boot or a `kickstart`.
+- Scripts and checks that read Tailscale state must use the daemon's CLI with `--socket`, not
+  `/Applications/Tailscale.app/Contents/MacOS/Tailscale`. After the cutover the app's binary
+  reports the app's backend, which is stopped.
+
+### Log and exit codes
+
+`~/.cache/tailscaled-cutover/` holds `last-run.log` (the last cutover or rollback, ending with
+`tailscaled-cutover: finished: exit <code>`), `preflight.log`, `history.log` (one line per run)
+and the `serve-config-<UTC>.json` snapshots. A lock in the same directory keeps runs from
+overlapping.
+
+| Code | Meaning |
+|---|---|
+| 0 | done and verified, already in place, or (preflight) ready |
+| 1 | failed (the message says what, whether anything changed, and the rollback command), or (preflight) not ready |
+| 2 | usage: missing `--hostname` on the first cutover, not root, unknown argument |
 
 ## SSH Tunnel Cheat Sheet
 

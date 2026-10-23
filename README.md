@@ -34,6 +34,7 @@ Relay is a dumb pipe. All intelligence lives inside native Claude Code CLI sessi
 | Script | Description |
 |--------|-------------|
 | `infra/setup-mac.sh` | Full Mac Mini setup (Node.js, Claude CLI, Relay, launchd) |
+| `infra/tailscaled/cutover.sh` | Move the Mac from the Tailscale GUI app to the open-source `tailscaled` LaunchDaemon (up at boot, before login), re-create serve/funnel, verify; `--preflight`, `--rollback`. See [RUNBOOK](docs/RUNBOOK.md#tailscale-daemon) |
 | `scripts/relay-deploy.sh` | Deploy Relay (run **on** the Mac Mini from `~/chuck-norris-rancho`): build a git SHA outside `~/relay`, swap only the code, restart, smoke-test, record the SHA in `~/relay/REVISION`; automatic and one-command rollback. See [RUNBOOK](docs/RUNBOOK.md#relay-deploy) |
 | `scripts/logs.sh` | Tail Relay logs (`error` option) |
 | `scripts/restart.sh` | Restart Relay service |
