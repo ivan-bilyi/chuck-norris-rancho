@@ -370,16 +370,23 @@ Commands below assume a shell with Homebrew on PATH. Over non-interactive SSH, r
    `brew install tailscale`. Homebrew has no `arm64_sonoma` bottle for `tailscale` or for `go`, so
    on macOS 14 it builds Go and then tailscale from source. That takes a long time on this
    machine. `--preflight` reports a missing formula.
-2. **A known-good starting point.** A first cutover (no daemon installed yet) starts only when
-   both of these hold; `--preflight` reports NOT READY and the cutover refuses otherwise:
-   - the GUI app, if installed, answers and is `Running` with a tailnet IPv4. A silent or
-     stopped app means the starting state is unknown: bring the tailnet up on the app first;
-   - no process other than Tailscale's own has a TCP listening socket, or any UDP socket, whose
-     local address lies in `100.64.0.0/10` or `fd7a:115c:a1e0::/48`. Such a process fails while
+2. **A known-good starting point.** A first cutover (no daemon installed and loaded yet) starts
+   only when both of these hold; `--preflight` reports NOT READY and the cutover refuses
+   otherwise:
+   - the GUI app answers and is `Running` with a tailnet IPv4. A silent or stopped app means the
+     starting state is unknown: bring the tailnet up on the app first. With no app at
+     `/Applications/Tailscale.app` (or `TS_CUTOVER_APP`), no Tailscale VPN service may be
+     configured and no Tailscale GUI or network-extension process may run: an app installed
+     elsewhere cannot be switched off, and the daemon must not run next to it. A host that never
+     had the app passes;
+   - no process other than Tailscale's own (`tailscaled`, the GUI app, its network extension)
+     has a TCP listening socket, or any UDP socket, whose local address lies in
+     `100.64.0.0/10` or `fd7a:115c:a1e0::/48`. Such a process fails while
      the address is gone. For example, AdGuard with its web UI on the tailnet address
      crash-loops, and the LAN falls back to unfiltered DNS. Binds to `127.0.0.1`, to the
      wildcard address or to LAN addresses pass. Fixing AdGuard's bind is homelab work. The check
-     reads `lsof` as root, and it refuses when `lsof` lists no TCP listener at all.
+     reads `lsof` as root with a time limit, and it refuses when either listing (TCP listeners,
+     UDP sockets) comes back empty.
 3. An SSH session over the LAN (by the host's `.local` name), not over the tailnet: the tailnet
    path drops during the cutover.
 4. Daytime, and a browser signed in to the tailnet's admin account, to approve the login URL and
@@ -441,17 +448,24 @@ or is stopped by a signal, its output and `last-run.log` end with, in this order
 3. what failed;
 4. `finished: exit <code>`.
 
-If a cutover stopped part-way before the daemon was installed, the app is already off and a
-re-run refuses, because the starting point is no longer known-good. Run `--rollback` first.
+If a cutover stopped part-way before the daemon was installed and loaded, the app is already
+off and a re-run refuses, because the starting point is no longer known-good. The end of that
+run's log says so and gives only the rollback command: run `--rollback` first. A daemon plist
+that launchd has not loaded counts as not installed, and `--preflight` reports it.
 
 ### Rollback
 
 `sudo bash infra/tailscaled/cutover.sh --rollback --detach`, over the LAN.
 
-1. **It first proves that the app can come back, and changes nothing until then.** The login
-   user must have a GUI session (`launchctl print gui/<uid>`). The app is launched in that
-   session and stays disconnected, and its backend must answer. If not, the rollback refuses and
-   leaves the daemon running. Log in on the console or over Screen Sharing, then run it again.
+1. **It first proves that the app can come back, and changes nothing until then.**
+   - The login user must have a GUI session (`launchctl print gui/<uid>`). The app is launched
+     in that session and stays disconnected, and its backend must answer. If not, log in on the
+     console or over Screen Sharing, then run it again.
+   - If the backend answers `NeedsLogin`, `gui-prefs.txt` must exist, because those prefs are
+     restored after the new login. If it is missing, run `--preflight` once (it records them
+     from the app), then run the rollback again.
+
+   In either refusal, the daemon keeps running.
 2. `tailscaled uninstall-system-daemon` (stop, unload, remove the plist and the
    `/usr/local/bin/tailscaled` copy), then `tailscaled --cleanup`.
 3. It re-enables the login-item helper and start on login.
@@ -462,8 +476,9 @@ re-run refuses, because the starting point is no longer known-good. Run `--rollb
 
 If the old node was already deleted in the admin console, the app's backend shows `NeedsLogin`.
 The rollback then runs `up --reset` with flags rebuilt from `gui-prefs.txt`, and the log shows
-the login URL. An exit node cannot be restored from its recorded ID; the log says so if one was
-set. The app then registers as a new node, so rename it and set its IPv4 as in step 5 of the
+the login URL. An exit node cannot be restored from its recorded ID. The log warns about it, and
+the exit node is never part of the verification, so a re-run does not fail on it. The app then
+registers as a new node, so rename it and set its IPv4 as in step 5 of the
 cutover. The daemon's state file stays, so a later cutover reuses the daemon's node.
 
 ### Operating the daemon

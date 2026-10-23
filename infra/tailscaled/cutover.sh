@@ -14,13 +14,17 @@
 #   sudo bash infra/tailscaled/cutover.sh --hostname <name> --detach
 #   sudo bash infra/tailscaled/cutover.sh --rollback --detach
 #
-# Starting point. A first cutover (no daemon installed yet) starts only from a
-# known-good state:
-#   - the GUI app, if installed, answers and is Running with a tailnet IPv4;
-#   - no process other than Tailscale's has a TCP listening socket or a UDP
-#     socket on a tailnet address (100.64.0.0/10 or fd7a:115c:a1e0::/48).
-#     Such a process fails while the address is gone (a DNS server bound
-#     there crash-loops). Wildcard and loopback binds are fine.
+# Starting point. A first cutover (no daemon installed and loaded yet) starts
+# only from a known-good state:
+#   - the GUI app answers and is Running with a tailnet IPv4. With no app at
+#     $APP, no Tailscale VPN service may be configured and no Tailscale GUI or
+#     network-extension process may run (an app elsewhere is not controllable);
+#   - no process other than Tailscale's own (tailscaled, the GUI app, its
+#     network extension) has a TCP listening socket or a UDP socket on a
+#     tailnet address (100.64.0.0/10 or fd7a:115c:a1e0::/48). Such a process
+#     fails while the address is gone (a DNS server bound there crash-loops).
+#     Wildcard, loopback and LAN binds are fine. Both lsof listings are
+#     bounded in time and must return something, or the check fails closed.
 # Before changing anything it records the GUI app's non-secret prefs
 # (GUI_PREF_KEYS) in the log dir, for the rollback.
 #
@@ -57,15 +61,18 @@
 # renamed in the admin console, a re-run moves the serve mounts to the new name.
 #
 # --rollback first proves that the GUI app can come back: the GUI user must
-# have a GUI session, and the app is launched there (it stays disconnected)
-# until its backend answers. Otherwise it refuses and changes nothing. Then:
+# have a GUI session, the app is launched there (it stays disconnected) and
+# its backend must answer; if it answers NeedsLogin, the prefs record must
+# exist. Otherwise it refuses and changes nothing. Then:
 # `tailscaled uninstall-system-daemon` (stops and unloads the job, removes the
 # plist and /usr/local/bin/tailscaled; the state file stays), re-enable the
 # helper and start on login, a bare `tailscale up` on the app (sets only
 # WantRunning, so the app's own prefs stay as they were), check the serve
 # mounts, verify, including the recorded GUI prefs. If the app's node was
 # deleted meanwhile (NeedsLogin), it runs `up --reset` with flags rebuilt from
-# the recorded prefs instead, and the log shows the login URL.
+# the recorded prefs instead, and the log shows the login URL. An exit node
+# cannot be restored from its recorded ID: it is only warned about, never
+# part of the verification.
 #
 # Every daemon call passes --socket explicitly: without it, the Homebrew CLI
 # on macOS talks to the GUI app's backend whenever that one answers.
@@ -364,7 +371,7 @@ record_gui_prefs() {  # save the app's non-secret prefs for the rollback
   chown "$GUI_USER" "$GUI_PREFS_FILE" 2>/dev/null || true
   show_lines "GUI app prefs recorded in $GUI_PREFS_FILE (the rollback checks them):" "$v"
 }
-recorded_up_flags() { # `up --reset` flags that restore the recorded GUI prefs
+recorded_up_flags() { # recorded_up_flags <prefs file>: `up --reset` flags that restore those prefs
   local k v
   while IFS='=' read -r k v; do
     case "$k" in
@@ -376,7 +383,7 @@ recorded_up_flags() { # `up --reset` flags that restore the recorded GUI prefs
       AdvertiseRoutes) [ -z "$v" ] || echo "--advertise-routes=$v" ;;
       RunSSH)          [ "$v" != true ] || echo --ssh ;;
     esac
-  done < "$GUI_PREFS_FILE"
+  done < "$1"
 }
 
 # Serve config, normalised to sorted lines:
@@ -508,6 +515,12 @@ gui_vpn_id() {
   scutil --nc list 2>/dev/null | awk -v id="[VPN:$APP_ID]" \
     'index($0, id) { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9A-Fa-f]+-[0-9A-Fa-f]+-/) { print $i; exit } }'
 }
+ts_vpns() {       # every Tailscale VPN service, any variant: "<state> [VPN:<id>]" per line
+  scutil --nc list 2>/dev/null | awk 'index($0, "[VPN:io.tailscale.") {
+    st = "?"; if (match($0, /\([A-Za-z ]+\)/)) st = substr($0, RSTART + 1, RLENGTH - 2); print st " " $NF }'
+}
+ts_gui_procs() { pgrep -x Tailscale 2>/dev/null | tr '\n' ' ' | sed 's/ $//'; }     # the GUI app, any user
+ts_ne_procs() { pgrep -f 'io[.]tailscale[.]ipn[.].*network-extension|IPNExtension' 2>/dev/null | tr '\n' ' ' | sed 's/ $//'; }
 vpn_is_up() { case "$1" in Connected|Connecting|Reasserting) return 0 ;; *) return 1 ;; esac; }
 start_on_login() { as_user defaults read "$APP_ID" TailscaleStartOnLogin 2>/dev/null || true; }
 set_start_on_login() { as_user defaults write "$APP_ID" TailscaleStartOnLogin -bool "$1"; }
@@ -543,15 +556,17 @@ daemon_installed() { [ -f "$DAEMON_PLIST" ] && daemon_loaded; }
 run_at_load() { /usr/bin/plutil -extract RunAtLoad raw -o - "$DAEMON_PLIST" 2>/dev/null || true; }
 bin_version() { [ -x "$1" ] && "$1" --version 2>/dev/null | head -n 1; }
 
-# Processes other than Tailscale's with a TCP listening socket or a UDP socket
-# whose local address is a tailnet address (100.64.0.0/10 or
-# fd7a:115c:a1e0::/48). Status 2 when the sockets cannot be listed (lsof shows
-# no TCP listener at all, which never happens on a working host).
+# Processes other than Tailscale's own (tailscaled, the GUI app, its network
+# extension) with a TCP listening socket or a UDP socket whose local address
+# is a tailnet address (100.64.0.0/10 or fd7a:115c:a1e0::/48). Status 2 when
+# lsof lists no TCP listener, 3 when it lists no UDP socket: neither happens
+# on a working host, so the check fails closed.
 bound_listeners() {
   local tcp udp
-  tcp="$(lsof -nP +c 0 -iTCP -sTCP:LISTEN -F pcn 2>/dev/null)"
+  tcp="$(with_timeout "$CMD_TIMEOUT" lsof -nP +c 0 -iTCP -sTCP:LISTEN -F pcn 2>/dev/null)"
   [ -n "$tcp" ] || return 2
-  udp="$(lsof -nP +c 0 -iUDP -F pcn 2>/dev/null)"
+  udp="$(with_timeout "$CMD_TIMEOUT" lsof -nP +c 0 -iUDP -F pcn 2>/dev/null)"
+  [ -n "$udp" ] || return 3
   printf '%s\n%s\n' "$tcp" "$udp" | awk '
     /^p/ { pid = substr($0, 2); next }
     /^c/ { cmd = substr($0, 2); next }
@@ -559,7 +574,7 @@ bound_listeners() {
       n = substr($0, 2); a = n; sub(/->.*/, "", a)
       if (a ~ /^\[/) { a = substr(a, 2); sub(/\].*/, "", a) } else { sub(/:[^:]*$/, "", a) }
       a = tolower(a)
-      if (cmd ~ /^(io\.tailscale|[Tt]ailscale)/) next
+      if (cmd ~ /^(io\.tailscale\..*|tailscaled|Tailscale|IPNExtension)$/) next
       if (a ~ /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./ || a ~ /^fd7a:115c:a1e0:/) print cmd " pid " pid " " n
     }' | sort -u
 }
@@ -580,10 +595,18 @@ check_start() {
       START_PROBLEM="the GUI app's backend is ${ST_STATE}${ST_IP4:+ ($ST_IP4)}, not Running with a tailnet IPv4"
       START_ADVICE="$known_good"; return
     fi
+  else
+    local vpns procs
+    vpns="$(ts_vpns | tr '\n' ' ' | sed 's/ $//')"; procs="$(ts_gui_procs) $(ts_ne_procs)"; procs="${procs# }"; procs="${procs% }"
+    if [ -n "$vpns" ] || [ -n "$procs" ]; then
+      START_PROBLEM="there is no GUI app at $APP, but Tailscale is present (VPN services: ${vpns:-none}; GUI or network-extension pids: ${procs:-none})"
+      START_ADVICE="Point the script at the installed app (sudo TS_CUTOVER_APP=<path to Tailscale.app> bash …), or remove the leftover VPN configuration once nothing runs. The cutover does not put a second stack next to one it cannot control."
+      return
+    fi
   fi
   LISTENERS="$(bound_listeners)" || rc=$?
-  if [ "$rc" = 2 ]; then
-    START_PROBLEM="cannot list the host's sockets (lsof shows no TCP listener at all)"
+  if [ "$rc" = 2 ] || [ "$rc" = 3 ]; then
+    START_PROBLEM="cannot list the host's sockets (lsof returned no $([ "$rc" = 2 ] && echo 'TCP listener' || echo 'UDP socket') within ${CMD_TIMEOUT}s)"
     START_ADVICE="Check that lsof works as root; the cutover does not start blind."; return
   fi
   if [ -n "$LISTENERS" ]; then
@@ -631,7 +654,10 @@ report_end() {    # report_end <rc>: state first, then how to go back, then what
     return
   fi
   if [ "$CHANGED" = 1 ]; then
-    if [ "$MODE" = cutover ]; then
+    if [ "$MODE" = cutover ] && ! daemon_installed; then
+      say "to go back to the GUI app: $ROLLBACK_CMD"
+      say "(run it before any new attempt: the cutover starts only from a known-good GUI app, and a re-run now refuses)"
+    elif [ "$MODE" = cutover ]; then
       say "to go back to the GUI app: $ROLLBACK_CMD"
       say "or fix the cause and run the same command again: sudo bash $SCRIPT_ABS ${ORIG_ARGS[*]+${ORIG_ARGS[*]}}"
     else
@@ -755,9 +781,12 @@ run_preflight() {
   if [ "$active" = daemon ]; then
     say "already cut over: the daemon is Running. Re-run the cutover to verify:"
     say "    sudo bash $SCRIPT_ABS --detach"
-  elif [ -f "$DAEMON_PLIST" ]; then
+  elif daemon_installed; then
     problems=$((problems + 1))
     say "NOT READY: a cutover stopped part-way (the daemon is installed but not Running). Run the cutover command again to continue, or go back: $ROLLBACK_CMD"
+  elif [ -f "$DAEMON_PLIST" ]; then
+    problems=$((problems + 1))
+    say "NOT READY: $DAEMON_PLIST exists but launchd has not loaded it (a partial install?). Clear it first: $ROLLBACK_CMD"
   else
     check_start
     if [ -z "$START_PROBLEM" ]; then
@@ -781,7 +810,14 @@ run_preflight() {
 # ── cutover ────────────────────────────────────────────────────
 step_gui_off() {
   local st="" vpn pids n id wr="unknown" answers=0
-  if [ ! -x "$APP_BIN" ]; then say "GUI app: not installed; nothing to stop"; return 0; fi
+  if [ ! -x "$APP_BIN" ]; then
+    vpn="$(ts_vpns | awk '$1 ~ /^(Connected|Connecting|Reasserting)$/' | tr '\n' ' ')"; pids="$(ts_gui_procs)"
+    if [ -n "$vpn" ] || [ -n "$pids" ]; then
+      fail "gui down" "there is no GUI app at $APP, but a Tailscale VPN is up (${vpn:-none}) or a Tailscale GUI runs (pids ${pids:-none}); point TS_CUTOVER_APP at the app"
+    fi
+    say "GUI app: not installed at $APP; no Tailscale VPN up and no Tailscale GUI running"
+    return 0
+  fi
   vpn="$(gui_vpn)"
   if read_status app; then st="$ST_STATE"; answers=1; wr="$(app_wantrunning)"; fi
   say "GUI app: backend ${st:-not answering}; WantRunning ${wr:-off}; VPN service ${vpn:-none}"
@@ -892,7 +928,7 @@ run_cutover() {
   if ! { daemon_installed && read_status daemon && [ "$ST_STATE" = Running ]; }; then
     [ -n "$HOST" ] || { say "ERROR: --hostname <name> is required until the daemon is Running"; exit 2; }
   fi
-  if [ ! -f "$DAEMON_PLIST" ]; then    # a first cutover: the starting point must be known-good
+  if ! daemon_installed; then    # a first cutover (or a partial one): the starting point must be known-good
     check_start
     if [ -n "$START_PROBLEM" ]; then
       [ -z "$LISTENERS" ] || show_lines "bound to a tailnet address:" "$LISTENERS"
@@ -916,7 +952,7 @@ run_cutover() {
 
 # ── rollback ───────────────────────────────────────────────────
 run_rollback() {
-  local u="" b recorded="" flags=() f
+  local u="" b recorded="" flags=() f src have_exit want_exit
   json_selftest
   [ -x "$APP_BIN" ] || fail "rollback" "the GUI app is not installed at $APP; install the standalone app first"
   if [ -f "$GUI_PREFS_FILE" ]; then recorded=1; else say "WARNING: no record of the GUI app's prefs ($GUI_PREFS_FILE); they cannot be compared"; fi
@@ -929,6 +965,9 @@ run_rollback() {
   fi
   wait_backend app \
     || fail "rollback" "the GUI app's backend does not answer within ${BACKEND_TIMEOUT}s. The daemon was left as it is. Open Tailscale in $GUI_USER's session, then run this again."
+  if [ "$ST_STATE" = NeedsLogin ] && [ -z "$recorded" ]; then
+    fail "rollback" "the app's node needs a login and there is no record of its prefs ($GUI_PREFS_FILE) to restore after it. Run --preflight once (it records them from the app), then run this again. The daemon was left as it is."
+  fi
   say "GUI app: backend answers ($ST_STATE); now the daemon can go"
 
   # 2. Daemon off.
@@ -973,11 +1012,18 @@ run_rollback() {
     say "GUI app: already Running"
   elif [ "$ST_STATE" = NeedsLogin ]; then
     CHANGED=1
-    [ -n "$recorded" ] || fail "rollback" "the app's node needs a login and there is no record of its prefs: log in from the app's menu"
+    src="$GUI_PREFS_FILE"
+    if [ -z "$recorded" ]; then   # it went NeedsLogin after the proof: rebuild from the app's current prefs
+      src="$TMP/gui-prefs-now.txt"
+      # shellcheck disable=SC2086  # GUI_PREF_KEYS is a word list
+      prefs_values app $GUI_PREF_KEYS > "$src" || fail "rollback" "the app's node needs a login and its prefs cannot be read: log in from the app's menu"
+    fi
     while IFS= read -r f; do flags+=("$f"); done <<EOF
-$(recorded_up_flags)
+$(recorded_up_flags "$src")
 EOF
-    if grep -q '^ExitNodeID=.' "$GUI_PREFS_FILE"; then say "WARNING: the recorded exit node cannot be set from its ID; choose it again in the app"; fi
+    if grep -q '^ExitNodeID=.' "$src"; then
+      say "WARNING: the exit node ($(sed -n 's/^ExitNodeID=//p' "$src")) cannot be set from its ID: choose it again in the app."
+    fi
     say "GUI app: its node needs a login (deleted in the admin console?); restoring the recorded prefs"
     bring_up app --reset ${flags[@]+"${flags[@]}"}
   else
@@ -991,10 +1037,18 @@ EOF
   if read_status app && [ "$ST_STATE" = Running ] && [ -n "$ST_IP4" ]; then :; else say "verify: GUI backend ${ST_STATE:-not answering}, IPv4 ${ST_IP4:-none}"; bad=1; fi
   check_prefs app WantRunning=true || { say "verify: prefs:$PREF_DIFF"; bad=1; }
   if [ -n "$recorded" ]; then
-    while IFS= read -r f; do [ -z "$f" ] || rec+=("$f"); done < "$GUI_PREFS_FILE"
+    # The exit node is only warned about: a node that had to log in again
+    # cannot get it back from its recorded ID, so it would never verify.
+    while IFS= read -r f; do
+      case "$f" in ""|ExitNodeID=*) continue ;; esac
+      rec+=("$f")
+    done < "$GUI_PREFS_FILE"
     if [ "${#rec[@]}" -gt 0 ]; then
       check_prefs app "${rec[@]}" || { say "verify: GUI prefs differ from the record:$PREF_DIFF"; bad=1; }
     fi
+    want_exit="$(sed -n 's/^ExitNodeID=//p' "$GUI_PREFS_FILE")"
+    have_exit="$(prefs_values app ExitNodeID 2>/dev/null | sed -n 's/^ExitNodeID=//p')"
+    [ "$want_exit" = "$have_exit" ] || say "WARNING: the exit node is '${have_exit:-none}', the record says '$want_exit': set it again in the app (not part of the verification)"
   fi
   serve_matches app || { say "verify: serve/funnel differs"; bad=1; }
   ! daemon_loaded || { say "verify: the daemon is still loaded"; bad=1; }
